@@ -158,7 +158,7 @@ PANEL_KINDS: FrozenSet[SemKind] = ALL_KINDS - {SemKind.NUMERIC_ADD, SemKind.NUME
 
 # operand 叶的初始 SemKind 按其 OperandKind(词表/使用者声明)定。默认价/量/特征皆 RAW
 # (与去枚举前逐位一致);NORMALIZED(使用者声明的已截面归一特征)→ SemKind.NORMALIZED,
-# 直接复用现成 cs-forbid 剪冗余 cs_*(无新机制)。详见 markets/README.md。
+# 直接复用现成 cs-forbid 剪冗余 cs_*(无新机制)。
 _OPERAND_SEMKIND: Dict[OperandKind, SemKind] = {
     OperandKind.PRICE:      SemKind.RAW,
     OperandKind.VOLUME:     SemKind.RAW,

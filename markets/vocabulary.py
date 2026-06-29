@@ -26,8 +26,7 @@ from typing import FrozenSet, Iterable, Mapping, Optional, Tuple
 
 class OperandKind(IntEnum):
     """operand 的语义类别 —— 自动分类(classify_kind)产出 PRICE/VOLUME/FEATURE,
-    用户可经 from_columns(overrides=...) 覆盖(含声明 NORMALIZED 补语义精度)。
-    各类别对引擎的语义含义见 markets/README.md。"""
+    用户可经 from_columns(overrides=...) 覆盖(含声明 NORMALIZED 补语义精度)。"""
     PRICE = 0       # 原始价格水平 → raw-level(G0 拒纯 wrapper);grammar 初始 SemKind=RAW
     VOLUME = 1      # 原始成交/流动性水平 → raw-level;SemKind=RAW;5m→1h 聚合按名自动求和
     FEATURE = 2     # 一般特征(funding/oi/动量/波动…)→ 非 raw-level;SemKind=RAW
@@ -125,7 +124,7 @@ def from_columns(columns: Iterable[str],
     require_base:缺基础量价列(high/low/close/volume,非衍生)即报错;
     overrides:{列名: OperandKind} —— **使用者自定义** operand 语义判定,覆盖该列自动分类。
       唯一 operand-耦合的语义钩子由此定制:声明 raw-level 归属(PRICE/VOLUME)、或把已截面归一的
-      特征声明 NORMALIZED(顺带补语义精度,让 cs-forbid 剪冗余)。详见 markets/README.md。"""
+      特征声明 NORMALIZED(顺带补语义精度,让 cs-forbid 剪冗余)。"""
     skip = set(exclude)
     ov = dict(overrides or {})
     names = [c for c in columns if c not in skip]
