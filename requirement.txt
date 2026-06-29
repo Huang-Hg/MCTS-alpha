@@ -1,0 +1,17 @@
+# 服务器(Linux)装机:
+#   pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirement.txt
+# Windows 开发机已用 D:\03learn\machine\.venv,这里只列实际依赖。
+
+numpy>=2.0
+pandas>=2.0
+pyarrow>=15
+torch>=2.0           # CPU 版即可,通过上面的 --extra-index-url 拉 cpu wheel
+deap>=1.4            # gp-baseline 因子挖掘(NSGA-II 强类型 GP)
+
+"把求值器写成 C 表达式 VM(融合执行):
+      这不是"把 Python 翻译成 C",而是改变内存访问结构——也是你刚问的空间优化的同一个答案:
+      - 一次 C 调用吃整棵 token 树(to_token_tree 已有序列化),postorder 走树
+      - 算子链融合:elementwise/binary 链在一个循环 pass 里算完(现在每个节点一遍全数组 pass,带宽瓶颈下 pass 数≈时间)
+      - 列分块:ts/pair 按列块流水,cs 节点做屏障;中间结果从 N×0.73GB 降到 O(块)
+      - 寄存器式 buffer 池复用,GIL 全程释放,OMP 在内
+      - 与现路径逐列同序计算 → 逐位一致可断言"的可行性如何;还有你的其他设计请给我审阅后再改
