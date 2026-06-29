@@ -37,131 +37,16 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
+from markets.profile import ACTIVE as _ACTIVE_PROFILE
+from markets.vocabulary import OperandKind, OperandVocabulary, crypto_vocabulary
+
 
 # ============================================================================
-# 终结符:Operand / Const / Window
+# 终结符:Operand —— 数据驱动词表(直接沿用 parquet 列名,无枚举)
 # ============================================================================
-
-class OperandToken(IntEnum):
-    """终端 operand:从 5m parquet 列名映射。
-    分组:
-      - 价格:OPEN/HIGH/LOW/CLOSE
-      - 量:VOLUME/QUOTE_VOLUME/NUMBER_OF_TRADES/TAKER_IMBALANCE
-      - OI:SUM_OI/SUM_OI_VALUE/OI_LOG_RET
-      - LSR(币安特有 long-short ratio):COUNT_TOP_LSR/SUM_TOP_LSR/COUNT_LSR/SUM_TAKER_LSR
-      - 真 1m trailing-1h 风险特征(per-5m-bar 1m building block 经 rolling-12 拼成 60-1m 真值;给 sizing 头):
-        VPIN_12(toxicity)/ KYLE_12(价格冲击);均为 forward-vol 预测器(增量 fvol IC 两段符号稳)
-      - 事件 / regime 物化特征(P0,数据层 build_5m_panel.py 已预算,grammar 直接消费,
-        免去搜索器在深 ts 嵌套里重发现):
-        VOL_ZSCORE_288 / TAKER_IMB_EMA_48 / OI_CHG_48 / OI_CHG_288 / MA_DIST_48 / MA_DIST_288
-    IntEnum value 留 hole 不复用(已删 operand 的槽位)。
-    """
-    OPEN                  = 0
-    HIGH                  = 1
-    LOW                   = 2
-    CLOSE                 = 3
-    VOLUME                = 4
-    QUOTE_VOLUME          = 5
-    # 6,7,8 留空 — 已删 operand 槽位(不复用)
-    NUMBER_OF_TRADES      = 9
-    TAKER_BUY_QUOTE       = 10   # 留作 deployed bundle 兼容(taker_imbalance raw 版,affine 等价)
-    TAKER_IMBALANCE       = 11
-    SUM_OI                = 12
-    OI_LOG_RET            = 13
-    SUM_OI_VALUE          = 14   # = SUM_OI × close 隐含 raw price,bt max_concentration 0.20 约束 mono 影响
-    # 15,16 留空 — 已删 operand 槽位(不复用)
-    COUNT_TOP_LSR         = 17
-    SUM_TOP_LSR           = 18
-    COUNT_LSR             = 19
-    SUM_TAKER_LSR         = 20
-    # 21-25 留空 — 已删 operand 槽位(不复用)
-    # P0 事件 / regime 物化特征
-    VOL_ZSCORE_288        = 26   # 1d 成交量 z-score(成交量爆发 regime)
-    TAKER_IMB_EMA_48      = 27   # 4h 主动买卖盘 EMA(主动单流 regime)
-    OI_CHG_48             = 28   # 4h OI 变化率(短期杠杆建立)
-    OI_CHG_288            = 29   # 1d OI 变化率(中期杠杆累积)
-    MA_DIST_48            = 30   # 4h MA 距离 (close-mean)/std(短期 breakout)
-    MA_DIST_288           = 31   # 1d MA 距离(中期 breakout / mean-reversion)
-    # P0+ 永续独有 funding/basis 特征(enrich_5m_panel.py 物化)
-    PREMIUM_INDEX_5M      = 32   # (mark − index)/index,实时 funding 压力
-    FUNDING_RATE_INTERP   = 33   # 当前 funding cycle carry rate(4h or 8h discrete)
-    FUNDING_COUNTDOWN_NORM = 34  # funding 周期内相对位置 ∈ [0, 1]
-    # 35-38 留空 — 已删 operand 槽位(不复用)
-    # 派生 operand(非 parquet 列,adapter.load_panel 合成注入;不进 OPERAND_COLUMNS)
-    # 真 1m trailing-1h(W=12 5m bar)风险特征(给 sizing 头)
-    VPIN_12               = 40   # Σ|1m签名流| / Σqv,order-flow toxicity → forward vol
-    KYLE_12               = 41   # Σ|1m收益| / Σ|1m签名流|,价格冲击/illiq → forward vol
-    TENURE_NORM           = 39   # recency = exp(−tenure/288),tenure=连续 qvol>0 bar 数;
-                                 #   把"刚进 top-N"显式成可挖矿特征
-    # === 2026-06-24 新增:数据里已有但此前未喂搜索的特征(抬 IC 上限;42-55)===
-    # 桶内 1m 微结构(5m OHLCV 无法重建 → 纯增信息)
-    INTRA_RV              = 42   # 桶内 1m 已实现波动率
-    INTRA_SUM_ABS_SF      = 43   # 桶内 Σ|1m 签名流|(order-flow)
-    INTRA_SUM_ABS_RET     = 44   # 桶内 Σ|1m 收益|
-    # K 线体型(桶内形态)
-    BODY_PCT              = 45   # 实体占比 |close−open|/range
-    LOG_RET_OC            = 46   # log(close/open) 开→收内收益
-    RANGE_PCT             = 47   # 振幅 (high−low)/·
-    # 多 horizon 动量(12/48/144/288 ×5m = 1h/4h/12h/1d;len≤6 建不出深 ts 链 → 预算金子)
-    RET_12                = 48
-    RET_48                = 49
-    RET_144               = 50
-    RET_288               = 51
-    # 多 horizon 价格已实现波动(≠ vol_zscore 的成交量 z)
-    RV_12                 = 52
-    RV_48                 = 53
-    RV_144                = 54
-    RV_288                = 55
-
-
-# 列名映射(必须存在于 parquet_5m 输出 schema 中)
-# 注:TENURE_NORM 不在此 — 它是 adapter 派生注入的 operand,无对应 parquet 列。
-OPERAND_COLUMNS: Dict[OperandToken, str] = {
-    OperandToken.OPEN:                 'open',
-    OperandToken.HIGH:                 'high',
-    OperandToken.LOW:                  'low',
-    OperandToken.CLOSE:                'close',
-    OperandToken.VOLUME:               'volume',
-    OperandToken.QUOTE_VOLUME:         'quote_volume',
-    OperandToken.NUMBER_OF_TRADES:     'number_of_trades',
-    OperandToken.TAKER_BUY_QUOTE:      'taker_buy_quote_volume',
-    OperandToken.TAKER_IMBALANCE:      'taker_imbalance',
-    OperandToken.SUM_OI:               'sum_oi',
-    OperandToken.OI_LOG_RET:           'oi_log_ret',
-    OperandToken.SUM_OI_VALUE:         'sum_oi_value',
-    OperandToken.COUNT_TOP_LSR:        'count_top_lsr',
-    OperandToken.SUM_TOP_LSR:          'sum_top_lsr',
-    OperandToken.COUNT_LSR:            'count_lsr',
-    OperandToken.SUM_TAKER_LSR:        'sum_taker_lsr',
-    OperandToken.VPIN_12:              'vpin_12',
-    OperandToken.KYLE_12:              'kyle_12',
-    # P0 事件 / regime 物化
-    OperandToken.VOL_ZSCORE_288:       'vol_zscore_288',
-    OperandToken.TAKER_IMB_EMA_48:     'taker_imb_ema_48',
-    OperandToken.OI_CHG_48:            'oi_chg_48',
-    OperandToken.OI_CHG_288:           'oi_chg_288',
-    OperandToken.MA_DIST_48:           'ma_dist_48',
-    OperandToken.MA_DIST_288:          'ma_dist_288',
-    # P0+ 永续独有 funding/basis(enrich_5m_panel.py 加列)
-    OperandToken.PREMIUM_INDEX_5M:      'premium_index_5m',
-    OperandToken.FUNDING_RATE_INTERP:   'funding_rate_interp',
-    OperandToken.FUNDING_COUNTDOWN_NORM:'funding_countdown_norm',
-    # 2026-06-24 新增:1m 微结构 + K线体型 + 多 horizon 动量/波动
-    OperandToken.INTRA_RV:              'intra_rv',
-    OperandToken.INTRA_SUM_ABS_SF:      'intra_sum_abs_sf',
-    OperandToken.INTRA_SUM_ABS_RET:     'intra_sum_abs_ret',
-    OperandToken.BODY_PCT:              'body_pct',
-    OperandToken.LOG_RET_OC:            'log_ret_oc',
-    OperandToken.RANGE_PCT:             'range_pct',
-    OperandToken.RET_12:                'ret_12',
-    OperandToken.RET_48:                'ret_48',
-    OperandToken.RET_144:               'ret_144',
-    OperandToken.RET_288:               'ret_288',
-    OperandToken.RV_12:                 'rv_12',
-    OperandToken.RV_48:                 'rv_48',
-    OperandToken.RV_144:                'rv_144',
-    OperandToken.RV_288:                'rv_288',
-}
+# operand 身份 = parquet 列名字符串(进 AST Node.op / panels key / 序列化)。
+# 默认 = crypto_vocabulary()(Binance 永续 5m panel 42 列);换市场经 set_vocabulary()
+# 注入 from_columns(<其 parquet 列>),PRODUCTIONS 随之重建。词表/分类见 markets.vocabulary。
 
 
 # 常数池 — 按算子类型分两组(避免 mul/pow 的 ±1 = identity 浪费搜索空间):
@@ -171,10 +56,10 @@ OPERAND_COLUMNS: Dict[OperandToken, str] = {
 ADD_CONSTANTS:    Tuple[float, ...] = (-2.0, -1.0, -0.5, 0.5, 1.0, 2.0)
 MULPOW_CONSTANTS: Tuple[float, ...] = (-2.0, -0.5, 0.5, 2.0)
 
-# 窗口(**1h bars**):1h / 2h / 4h / 8h / 16h / 1d / 2d / 4d / 7d / 14d
-# alpha operand 面板 1h(load 时尾部小时聚合,adapter.aggregate_5m_to_1h),ts/pair 窗口为 1h 单位。
-# max=336(14d)≤ live cold_load 21d×24=504 可部署。
-WINDOWS: Tuple[int, ...] = (1, 2, 4, 8, 16, 24, 48, 96, 168, 336)
+# 窗口(ts/pair 的回看 bar 数,单位 = 市场 bar cadence)的**唯一来源 = markets.MarketProfile.windows**
+# (与 bars_per_day 等市场常量同处,不在此重复字面量)。ACTIVE_WINDOWS = 当前生效集(默认 = active
+# profile 的 windows;crypto 1h 圆整档 / 日线 3..240 交易日),换市场经 set_windows(panel.profile.windows)
+# 注入 → 重建 PRODUCTIONS(消除 1h 窗套日线 panel 致长窗全 warmup 死)。
 
 
 # ============================================================================
@@ -271,6 +156,16 @@ ALL_KINDS:   FrozenSet[SemKind] = frozenset(SemKind)
 # panel 类型集合 = 排除非 panel 叶类型(三种 NUMERIC*/WINDOW_VAL)。
 PANEL_KINDS: FrozenSet[SemKind] = ALL_KINDS - {SemKind.NUMERIC_ADD, SemKind.NUMERIC_MULPOW, SemKind.WINDOW_VAL}
 
+# operand 叶的初始 SemKind 按其 OperandKind(词表/使用者声明)定。默认价/量/特征皆 RAW
+# (与去枚举前逐位一致);NORMALIZED(使用者声明的已截面归一特征)→ SemKind.NORMALIZED,
+# 直接复用现成 cs-forbid 剪冗余 cs_*(无新机制)。详见 markets/README.md。
+_OPERAND_SEMKIND: Dict[OperandKind, SemKind] = {
+    OperandKind.PRICE:      SemKind.RAW,
+    OperandKind.VOLUME:     SemKind.RAW,
+    OperandKind.FEATURE:    SemKind.RAW,
+    OperandKind.NORMALIZED: SemKind.NORMALIZED,
+}
+
 
 # ============================================================================
 # Production 定义
@@ -286,7 +181,7 @@ class Production:
     """文法产生式 + α-Sem 类型标记。
 
     rhs_kind: 节点类别(用于 ast / encoder 派发)
-    op:       具体算子(OperandToken / UnaryOp / BinaryOp / CsOp / TsOp / PairOp)
+    op:       具体算子(operand=parquet 列名 str / UnaryOp / BinaryOp / CsOp / TsOp / PairOp)
     extra:    ts/pair 的窗口 w(int)
     children_nts: 子 NT 序列(占位用,数量决定 children 数)
     cost:     production 自身 cost
@@ -398,10 +293,11 @@ def all_productions() -> Tuple[Production, ...]:
     """枚举所有合法 productions,带 α-Sem 类型标记。"""
     out: List[Production] = []
 
-    # operand 叶 → out=RAW
-    for tok in OperandToken:
-        out.append(Production('operand', tok, None, (), PRODUCTION_COSTS['operand'],
-                              out_kind=SemKind.RAW, child_allowed=()))
+    # operand 叶(从 active 词表取,op = parquet 列名字符串);out_kind 按 OperandKind 定
+    # (默认 RAW;使用者声明 NORMALIZED 的特征 → NORMALIZED,触发 cs-forbid 剪冗余)。
+    for _op in ACTIVE_VOCAB.operands:
+        out.append(Production('operand', _op.name, None, (), PRODUCTION_COSTS['operand'],
+                              out_kind=_OPERAND_SEMKIND[_op.kind], child_allowed=()))
 
     # const 叶按 op 分组(per-op grid,#2):
     #   const_add → NUMERIC_ADD,只填 ADD_CONST 第二槽
@@ -415,7 +311,7 @@ def all_productions() -> Tuple[Production, ...]:
 
     # window 叶 → out=WINDOW_VAL,**只能**填 ts/pair 最后一槽
     # 跟 const 同类设计但隔离类型,防止填错槽位。cost=0(纯参数,不占预算)。
-    for w in WINDOWS:
+    for w in ACTIVE_WINDOWS:
         out.append(Production('window', w, None, (), 0,
                               out_kind=SemKind.WINDOW_VAL, child_allowed=()))
 
@@ -460,7 +356,7 @@ def all_productions() -> Tuple[Production, ...]:
                               out_kind=_constbin_out[op],
                               child_allowed=(_constbin_child0[op], slot_allowed)))
 
-    # ts(panel + window leaf):每个 op 1 production,window 由独立 len(WINDOWS) 个 productions 填
+    # ts(panel + window leaf):每个 op 1 production,window 由独立 len(ACTIVE_WINDOWS) 个 productions 填
     only_window: FrozenSet[SemKind] = frozenset({SemKind.WINDOW_VAL})
     for op in TsOp:
         forbid = _TS_FORBID.get(op, frozenset())
@@ -480,6 +376,32 @@ def all_productions() -> Tuple[Production, ...]:
                               child_allowed=(PANEL_KINDS, PANEL_KINDS, only_window)))
 
     return tuple(out)
+
+
+# active operand 词表 + 窗口集 —— 词表默认 crypto(列名直用);窗口集默认 = active profile.windows(单一来源)。
+# set_vocabulary/set_windows() 换市场重建 PRODUCTIONS。
+ACTIVE_VOCAB:    OperandVocabulary = crypto_vocabulary()
+ACTIVE_WINDOWS:  Tuple[int, ...]   = tuple(_ACTIVE_PROFILE.windows)
+
+
+def set_vocabulary(vocab: OperandVocabulary) -> None:
+    """切换 active operand 词表(数据驱动),重建模块级 PRODUCTIONS / NUM_PRODUCTIONS。
+    换市场时由数据层用 from_columns(<parquet 列>) 建词表后调用一次。下游 ast/expression/
+    adapter 经 panels[name] 字符串键自动对齐,无需改签名。"""
+    global ACTIVE_VOCAB, PRODUCTIONS, NUM_PRODUCTIONS
+    ACTIVE_VOCAB = vocab
+    PRODUCTIONS = all_productions()
+    NUM_PRODUCTIONS = len(PRODUCTIONS)
+
+
+def set_windows(windows: Tuple[int, ...]) -> None:
+    """切换 ts/pair 窗口集(单位 = 市场 bar cadence;crypto=1h、equity/ashare=日),重建 PRODUCTIONS。
+    换市场时由挖矿入口注入 `panel.profile.windows` 后调用一次。window 叶随之刷新,gp_baseline
+    `_build_pset` 运行时读 ACTIVE_WINDOWS → rebuild_pset() 同步(消除 import 顺序陷阱)。"""
+    global ACTIVE_WINDOWS, PRODUCTIONS, NUM_PRODUCTIONS
+    ACTIVE_WINDOWS = tuple(windows)
+    PRODUCTIONS = all_productions()
+    NUM_PRODUCTIONS = len(PRODUCTIONS)
 
 
 PRODUCTIONS: Tuple[Production, ...] = all_productions()

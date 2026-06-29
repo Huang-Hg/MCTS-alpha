@@ -24,12 +24,11 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from config.config import ini
+from config.config import ini, NeutralizeConfig
 from backtest import ops
 from evaluation.cache import EvalCache
 from evaluation.ast import AlphaTree
 from evaluation.expression import evaluate as eval_tree
-from evaluation.grammar import OperandToken
 from rl.alpha_pool import AlphaPool
 from rl.sizing import build_crowding_basis, crowding_neutralize, _CROWD_TOKENS
 
@@ -180,13 +179,14 @@ class EvalConfig:
     # 准入便宜门:|rank_ic| < 此 → 跳过财富路径(reward 已现算,免费)
     admit_rankic_min:      float = 0.01
     top_k:                 int   = ini('backtest_reward', 'top_k', 8)   # top-K gross Sharpe 度量每腿仓数
-    # 候选 ⊥ 拥挤子空间(funding/lsr/基差/OI)再评分 → 强制方向 alpha、剿 carry 收割(2026-06-26)
-    crowding_neutral:      bool  = ini('evaluator', 'crowding_neutral', False)
+    # 候选 ⊥ 拥挤子空间(funding/lsr/基差/OI)再评分 → 强制方向 alpha、剿 carry 收割(2026-06-26)。
+    # 统一中性化单一源:[neutralize].neutralize 含 crowding 即开(见 config.NeutralizeConfig)。
+    crowding_neutral:      bool  = NeutralizeConfig().crowding
 
 
 def evaluate_alpha(
     tree: AlphaTree,
-    panels: Dict[OperandToken, np.ndarray],
+    panels: Dict[str, np.ndarray],
     y_future: np.ndarray,
     pool_obj: AlphaPool,
     cfg: EvalConfig = EvalConfig(),

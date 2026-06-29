@@ -34,10 +34,11 @@ from deap import algorithms, base, creator, gp, tools
 from config.config import ini
 from backtest import ops
 from evaluation.cache import EvalCache
+from evaluation import grammar as _grammar
 from evaluation.ast import AlphaTree, Node
 from evaluation.grammar import (
-    ADD_CONSTANTS, MULPOW_CONSTANTS, WINDOWS,
-    BinaryOp, ConstBinaryOp, CsOp, OperandToken, PairOp, TsOp, UnaryOp,
+    ADD_CONSTANTS, MULPOW_CONSTANTS,
+    BinaryOp, ConstBinaryOp, CsOp, PairOp, TsOp, UnaryOp,
 )
 from rl.alpha_pool import AlphaPool
 from rl.evaluator import EvalConfig, _REWARD_FLOOR, evaluate_alpha
@@ -96,10 +97,10 @@ def _build_pset() -> Tuple[gp.PrimitiveSetTyped, Dict[str, tuple], Dict[str, tup
         nm = 'p_' + op.value
         pset.addPrimitive(_id, [Panel, Panel, WinT], Panel, name=nm); prim_map[nm] = ('pair', op)
 
-    for tok in OperandToken:
-        nm = 'op_' + tok.name
-        pset.addTerminal(tok, Panel, name=nm); term_map[nm] = ('operand', tok)
-    for w in WINDOWS:
+    for _op in _grammar.ACTIVE_VOCAB.operands:
+        nm = 'op_' + _op.name
+        pset.addTerminal(_op.name, Panel, name=nm); term_map[nm] = ('operand', _op.name)
+    for w in _grammar.ACTIVE_WINDOWS:                  # 运行时读 → set_windows(日线集)经 rebuild_pset 生效
         nm = 'w%d' % w
         pset.addTerminal(w, WinT, name=nm); term_map[nm] = ('window', int(w))
     for c in ADD_CONSTANTS:
@@ -112,6 +113,15 @@ def _build_pset() -> Tuple[gp.PrimitiveSetTyped, Dict[str, tuple], Dict[str, tup
 
 
 _PSET, _PRIM_MAP, _TERM_MAP = _build_pset()
+
+
+def rebuild_pset() -> None:
+    """按当前 `_grammar.ACTIVE_VOCAB` + `ACTIVE_WINDOWS` 重建模块级 _PSET/_PRIM_MAP/_TERM_MAP
+    (operand 叶 + window 叶集)。operator(unary/cs/binary/ts/pair)+ const 不随市场变。
+    run_gp 入口调用 → 消除『import gp_baseline(冻结 crypto 词表/1h 窗)早于 set_vocabulary/set_windows
+    (equity 词表/日线窗)』的 import 顺序陷阱(_generate/gen_expr/deap_to_alphatree 均运行时读 _PSET)。"""
+    global _PSET, _PRIM_MAP, _TERM_MAP
+    _PSET, _PRIM_MAP, _TERM_MAP = _build_pset()
 
 
 # ---- typed 树生成(DEAP genFull/HalfAndHalf 对 terminal-only 类型 WinT/AddC/MulC 会崩:
@@ -237,12 +247,22 @@ def _build_pool(collected: Dict, capacity: int):
 # ============================================================================
 def run_gp(panels, y, capacity: int, seed: int = 42,
            pop_size: Optional[int] = None, n_gen: Optional[int] = None, log=print):
-    """跑 DEAP NSGA-II 强类型 GP,返回 (pool, collected)。pop_size 须被 4 整除(selTournamentDCD)。"""
+    """跑 DEAP NSGA-II 强类型 GP,返回 (pool, collected)。pop_size 须被 4 整除(selTournamentDCD)。
+    中性化(crowding 等)由统一 [neutralize] 经 EvalConfig 驱动,不在此传参。"""
     pop_size = pop_size or _POP
     n_gen = n_gen if n_gen is not None else _NGEN
     if pop_size % 4 != 0:
         pop_size += 4 - pop_size % 4
     random.seed(seed); np.random.seed(seed)
+
+    # 运行时按当前 ACTIVE_VOCAB 重建 _PSET(operand 叶集),消除 import 顺序陷阱(gp-equity 必需:
+    # set_vocabulary(equity) 在 import gp_baseline 之后才执行)。再前置断言词表 ⊆ panels,vocab/panels
+    # 不一致即大声崩(否则深处 eval 才 KeyError,难定位)。
+    rebuild_pset()
+    _vocab_ops = {v for (t, v) in _TERM_MAP.values() if t == 'operand'}
+    assert _vocab_ops <= set(panels.keys()), \
+        f'GP operand 词表 {sorted(_vocab_ops - set(panels.keys()))} 不在 panels(keys={sorted(panels)});' \
+        f'set_vocabulary 与 panels 不一致(import 顺序或市场切换出错)'
 
     tb = base.Toolbox()
     tb.register("expr", gen_expr, _INIT_MIN_H, _INIT_MAX_H)

@@ -13,65 +13,14 @@
  *     numpy 不能直接 reinterpret 的硬约束(dtype、ndim、shape 一致性、窗口正)。
  */
 
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
+#include "npy_glue.h"   /* 共享 numpy 胶水 + module 样板(消除本地 as_panel / import_array 重复)*/
+#include "ops.hpp"
 
-#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
-#include <numpy/arrayobject.h>
-
-#include "ops.h"
-
-
-/* ---------- 工具:从 PyObject 拿 (T,S) C-连续 float64 ---------- */
-
-static inline PyArrayObject* as_panel(PyObject* obj) {
-    PyArrayObject* arr = (PyArrayObject*)PyArray_FROMANY(
-        obj, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS | NPY_ARRAY_ALIGNED);
-    return arr;  /* NULL on failure with exception set */
-}
-
-/* ---------- 工具:(T,S) float64 行步长视图(零拷贝)----------
- * f64 + 2D + 列步长 == 8B + 行步长 ≥ S·8B(正、行不重叠)→ 直接借引用,
- * *ld_out = 行步长(元素数)。其余形态 FROMANY 物化 C-连续拷贝(ld = S)。 */
-static inline PyArrayObject* as_panel_ld(PyObject* obj, int64_t* ld_out) {
-    if (PyArray_Check(obj)) {
-        PyArrayObject* a = (PyArrayObject*)obj;
-        if (PyArray_TYPE(a) == NPY_DOUBLE && PyArray_NDIM(a) == 2 &&
-            PyArray_STRIDE(a, 1) == (npy_intp)sizeof(double) &&
-            PyArray_STRIDE(a, 0) >= (npy_intp)(PyArray_DIM(a, 1) * sizeof(double)) &&
-            PyArray_ISALIGNED(a)) {
-            Py_INCREF(a);
-            *ld_out = (int64_t)(PyArray_STRIDE(a, 0) / (npy_intp)sizeof(double));
-            return a;
-        }
-    }
-    PyArrayObject* arr = as_panel(obj);
-    if (arr) *ld_out = (int64_t)PyArray_DIM(arr, 1);
-    return arr;
-}
-
-/* out= 目标:可写 float64 (T,S) 列连续视图。shape/dtype/步长是 segfault 边界,必须校验。 */
-static inline PyArrayObject* as_out_ld(PyObject* obj, npy_intp T, npy_intp S, int64_t* ld_out) {
-    PyArrayObject* a = (PyArrayObject*)obj;
-    if (!PyArray_Check(obj) || PyArray_TYPE(a) != NPY_DOUBLE || PyArray_NDIM(a) != 2 ||
-        PyArray_DIM(a, 0) != T || PyArray_DIM(a, 1) != S ||
-        PyArray_STRIDE(a, 1) != (npy_intp)sizeof(double) ||
-        PyArray_STRIDE(a, 0) < (npy_intp)(S * (npy_intp)sizeof(double)) ||
-        !PyArray_ISWRITEABLE(a) || !PyArray_ISALIGNED(a)) {
-        PyErr_SetString(PyExc_ValueError,
-                        "out= must be a writable float64 (T,S) view with contiguous columns");
-        return NULL;
-    }
-    Py_INCREF(a);
-    *ld_out = (int64_t)(PyArray_STRIDE(a, 0) / (npy_intp)sizeof(double));
-    return a;
-}
-
-static inline PyArrayObject* alloc_panel(npy_intp T, npy_intp S, int64_t* ld_out) {
-    npy_intp dims[2] = { T, S };
-    *ld_out = (int64_t)S;
-    return (PyArrayObject*)PyArray_EMPTY(2, dims, NPY_DOUBLE, 0);
-}
+/* 沿用旧调用名 → backtest/npy_glue.h 共享胶水(C-连续 / 零拷贝行步长视图 / out 视图 / 分配)。 */
+#define as_panel     bt_as_2d
+#define as_panel_ld  bt_as_panel_ld
+#define as_out_ld    bt_as_out_ld
+#define alloc_panel  bt_alloc_panel
 
 
 /* ---------- Elementwise unary 通用模板 ---------- */
@@ -606,14 +555,4 @@ static PyMethodDef methods[] = {
 };
 
 
-static struct PyModuleDef moduledef = {
-    PyModuleDef_HEAD_INIT,
-    "_ops",                     /* m_name */
-    "Formulaic alpha C ops kernel.",  /* m_doc */
-    -1, methods, NULL, NULL, NULL, NULL,
-};
-
-PyMODINIT_FUNC PyInit__ops(void) {
-    import_array();
-    return PyModule_Create(&moduledef);
-}
+BT_MODULE(_ops, methods, "Formulaic alpha C ops kernel.")

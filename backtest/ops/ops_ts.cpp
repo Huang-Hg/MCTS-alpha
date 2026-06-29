@@ -14,16 +14,19 @@
  *   - _fm_unpack_clean / rolling_sum_simd_block / rolling_sum_scalar_one / rolling_sum_impl
  *   - rolling_var_impl  (var/std)
  *   - rolling_minmax_impl / rolling_argminmax_impl
- *   - _RANK_BUCKETS / _ts_rank_vi / _ts_rank_cmp / _bit_add / _bit_prefix / _bucketize_column
+ *   - _RANK_BUCKETS / _ts_rank_vi / _bit_add / _bit_prefix / _bucketize_column(std::sort)
  *   - _ts_rank_naive / _ts_rank_bucket
  */
 
-#include "ops.h"
+#include "ops.hpp"
 
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <algorithm>    /* std::sort */
+#include <vector>       /* std::vector scratch(RAII,取代手动 malloc/calloc/free) */
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -370,7 +373,7 @@ static void rolling_minmax_impl(const double* x, double* out, int64_t T, int64_t
                                 const int64_t* rng_lo, const int64_t* rng_hi) {
     #pragma omp parallel
     {
-        int64_t* deque = (int64_t*)malloc((size_t)w * sizeof(int64_t));
+        std::vector<int64_t> deque(w);                          /* per-thread 环形 buffer(RAII) */
         #pragma omp for schedule(static)
         for (int64_t s = 0; s < S; s++) {
             int64_t vlo, vhi;
@@ -410,7 +413,6 @@ static void rolling_minmax_impl(const double* x, double* out, int64_t T, int64_t
                 }
             }
         }
-        free(deque);
     }
 }
 
@@ -424,7 +426,7 @@ static void rolling_argminmax_impl(const double* x, double* out, int64_t T, int6
                                    int is_max, int64_t ldx, int64_t ldo) {
     #pragma omp parallel
     {
-        int64_t* deque = (int64_t*)malloc((size_t)w * sizeof(int64_t));
+        std::vector<int64_t> deque(w);                          /* per-thread 环形 buffer(RAII) */
         #pragma omp for schedule(static)
         for (int64_t s = 0; s < S; s++) {
             int64_t head = 0, tail = 0;
@@ -453,7 +455,6 @@ static void rolling_argminmax_impl(const double* x, double* out, int64_t T, int6
                 }
             }
         }
-        free(deque);
     }
 }
 
@@ -466,12 +467,6 @@ void fm_ts_arg_min(const double* x, double* out, int64_t T, int64_t S, int64_t w
 #define _RANK_BUCKETS 128
 struct _ts_rank_vi { double v; int64_t orig; };
 typedef struct _ts_rank_vi _ts_rank_vi_t;
-
-static int _ts_rank_cmp(const void* a, const void* b) {
-    double va = ((const _ts_rank_vi_t*)a)->v;
-    double vb = ((const _ts_rank_vi_t*)b)->v;
-    return (va < vb) ? -1 : (va > vb) ? 1 : 0;
-}
 
 static inline void _bit_add(int64_t* bit, int64_t size, int64_t i, int64_t delta) {
     for (; i <= size; i += i & -i) bit[i] += delta;
@@ -487,7 +482,7 @@ static void _bucketize_column(
     const double* x, int64_t T, int64_t ldx, int64_t s_idx, int B,
     int64_t* bucket_id, int64_t* n_finite_out)
 {
-    _ts_rank_vi_t* arr = (_ts_rank_vi_t*)malloc((size_t)T * sizeof(_ts_rank_vi_t));
+    std::vector<_ts_rank_vi_t> arr(T);                          /* (value, orig_t)(RAII) */
     int64_t n = 0;
     for (int64_t t = 0; t < T; t++) {
         double v = x[t * ldx + s_idx];
@@ -495,14 +490,16 @@ static void _bucketize_column(
         else { bucket_id[t] = 0; }
     }
     *n_finite_out = n;
-    if (n == 0) { free(arr); return; }
-    qsort(arr, (size_t)n, sizeof(_ts_rank_vi_t), _ts_rank_cmp);
+    if (n == 0) return;
+    /* 按值升序;tie 顺序未定(同旧 qsort 的 0-返回比较)——桶号按排序位置赋,
+     * 桶版本身 ±1/(2B) 近似,连续数据无 exact-tie → 逐位一致。 */
+    std::sort(arr.begin(), arr.begin() + n,
+              [](const _ts_rank_vi_t& a, const _ts_rank_vi_t& b) { return a.v < b.v; });
     for (int64_t k = 0; k < n; k++) {
         int64_t b = (k * B) / n + 1;
         if (b > B) b = B;
         bucket_id[arr[k].orig] = b;
     }
-    free(arr);
 }
 
 
@@ -656,14 +653,16 @@ static void _ts_rank_bucket(const double* x, double* out, int64_t T, int64_t S, 
     const int B = _RANK_BUCKETS;
     #pragma omp parallel for schedule(static)
     for (int64_t s = 0; s < S; s++) {
-        int64_t* bucket_id = (int64_t*)calloc((size_t)T, sizeof(int64_t));
+        std::vector<int64_t> bucket_buf(T, 0);                  /* calloc 语义(零初始化,RAII) */
+        int64_t* bucket_id = bucket_buf.data();
         int64_t n_finite;
         _bucketize_column(x, T, ldx, s, B, bucket_id, &n_finite);
         if (n_finite == 0) {
             for (int64_t t = 0; t < T; t++) out[t * ldo + s] = NAN;
-            free(bucket_id); continue;
+            continue;
         }
-        int64_t* bit = (int64_t*)calloc((size_t)(B + 2), sizeof(int64_t));
+        std::vector<int64_t> bit_buf(B + 2, 0);                 /* calloc 语义 */
+        int64_t* bit = bit_buf.data();
         int64_t cnt_nan = 0;
 
         for (int64_t t = 0; t < w - 1; t++) {
@@ -691,7 +690,6 @@ static void _ts_rank_bucket(const double* x, double* out, int64_t T, int64_t S, 
             if (ob == 0) cnt_nan--;
             else         _bit_add(bit, B, ob, -1);
         }
-        free(bit); free(bucket_id);
     }
 }
 
@@ -717,12 +715,12 @@ void fm_ts_rank(const double* x, double* out, int64_t T, int64_t S, int64_t w, i
 
 void fm_ts_corr(const double* a, const double* b, double* out, int64_t T, int64_t S, int64_t w,
                 int64_t lda_, int64_t ldb, int64_t ldo, const int64_t* rng_lo, const int64_t* rng_hi) {
-    int64_t* vbuf = NULL;
+    std::vector<int64_t> vbuf;                                  /* rng 缺省时的 [lo|hi](RAII) */
     const int64_t *vlo, *vhi;
     if (rng_lo) { vlo = rng_lo; vhi = rng_hi; }
     else {
-        vbuf = (int64_t*)malloc((size_t)S * 2 * sizeof(int64_t));
-        int64_t* lo = vbuf; int64_t* hi = vbuf + S;
+        vbuf.resize((size_t)S * 2);
+        int64_t* lo = vbuf.data(); int64_t* hi = vbuf.data() + S;
         #pragma omp parallel for schedule(static)
         for (int64_t s = 0; s < S; s++) {
             int64_t la, ha, lb, hb;
@@ -733,8 +731,10 @@ void fm_ts_corr(const double* a, const double* b, double* out, int64_t T, int64_
         }
         vlo = lo; vhi = hi;
     }
-    double* acc = (double*)malloc((size_t)S * 5 * sizeof(double));
-    int64_t* cnt = (int64_t*)malloc((size_t)S * sizeof(int64_t));
+    std::vector<double>  acc_buf((size_t)S * 5);                /* 5 滑窗累加器(RAII) */
+    std::vector<int64_t> cnt_buf(S);
+    double*  acc = acc_buf.data();
+    int64_t* cnt = cnt_buf.data();
     double *sa = acc, *sb = acc + S, *sab = acc + 2 * S, *saa = acc + 3 * S, *sbb = acc + 4 * S;
     #pragma omp parallel
     {
@@ -771,17 +771,16 @@ void fm_ts_corr(const double* a, const double* b, double* out, int64_t T, int64_
             }
         }
     }
-    free(acc); free(cnt); free(vbuf);
 }
 
 void fm_ts_cov(const double* a, const double* b, double* out, int64_t T, int64_t S, int64_t w,
                int64_t lda_, int64_t ldb, int64_t ldo, const int64_t* rng_lo, const int64_t* rng_hi) {
-    int64_t* vbuf = NULL;
+    std::vector<int64_t> vbuf;                                  /* rng 缺省时的 [lo|hi](RAII) */
     const int64_t *vlo, *vhi;
     if (rng_lo) { vlo = rng_lo; vhi = rng_hi; }
     else {
-        vbuf = (int64_t*)malloc((size_t)S * 2 * sizeof(int64_t));
-        int64_t* lo = vbuf; int64_t* hi = vbuf + S;
+        vbuf.resize((size_t)S * 2);
+        int64_t* lo = vbuf.data(); int64_t* hi = vbuf.data() + S;
         #pragma omp parallel for schedule(static)
         for (int64_t s = 0; s < S; s++) {
             int64_t la, ha, lb, hb;
@@ -792,8 +791,10 @@ void fm_ts_cov(const double* a, const double* b, double* out, int64_t T, int64_t
         }
         vlo = lo; vhi = hi;
     }
-    double* acc = (double*)malloc((size_t)S * 3 * sizeof(double));
-    int64_t* cnt = (int64_t*)malloc((size_t)S * sizeof(int64_t));
+    std::vector<double>  acc_buf((size_t)S * 3);                /* 3 滑窗累加器(RAII) */
+    std::vector<int64_t> cnt_buf(S);
+    double*  acc = acc_buf.data();
+    int64_t* cnt = cnt_buf.data();
     double *sa = acc, *sb = acc + S, *sab = acc + 2 * S;
     #pragma omp parallel
     {
@@ -826,5 +827,4 @@ void fm_ts_cov(const double* a, const double* b, double* out, int64_t T, int64_t
             }
         }
     }
-    free(acc); free(cnt); free(vbuf);
 }

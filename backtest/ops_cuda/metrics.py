@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import cupy as cp
 
-from backtest.ops_cuda import cs_rank
+from backtest.ops_cuda import cs_rank, k_per_t_ic, k_per_t_pnl
 
 _F64 = cp.float64
 
@@ -55,24 +55,10 @@ def holdable_coverage(x, y) -> float:
 
 
 def per_t_ic(x, y):
-    """(T,) 逐行 Pearson IC;n<3 或 dx≤0 或 dy≤0 → NaN(下游 nan-aware)。
-    公式贴 C:num=sxy−mx·sy;dx=sxx−mx·sx;dy=syy−my·sy。"""
-    m = cp.isfinite(x) & cp.isfinite(y)
-    xm = cp.where(m, x, _F64(0))
-    ym = cp.where(m, y, _F64(0))
-    n = m.sum(1, dtype=_F64)
-    sx = xm.sum(1, dtype=_F64); sy = ym.sum(1, dtype=_F64)
-    sxy = (xm * ym).sum(1, dtype=_F64)
-    sxx = (xm * xm).sum(1, dtype=_F64)
-    syy = (ym * ym).sum(1, dtype=_F64)
-    nsafe = cp.maximum(n, 1)
-    mx = sx / nsafe; my = sy / nsafe
-    num = sxy - mx * sy
-    dx = sxx - mx * sx
-    dy = syy - my * sy
-    valid = (n >= 3) & (dx > 0) & (dy > 0)
-    den = cp.sqrt(cp.where(valid, dx * dy, _F64(1)))
-    return cp.where(valid, num / den, cp.nan)
+    """(T,) 逐行 Pearson IC;n<3 或 dx≤0 或 dy≤0 → NaN(下游 nan-aware)。公式贴 C:
+    num=sxy−mx·sy;dx=sxx−mx·sx;dy=syy−my·sy。**融合单遍 warp-shuffle 核**(k_per_t_ic)替原
+    ~10 遍整盘 .sum(1) 归约;f64 累加器同精度(消费卡 f32 panel 仍全盘 f64 reduction)。"""
+    return k_per_t_ic(x, y)
 
 
 def _mean_over_finite(v):
@@ -177,14 +163,6 @@ def turnover(x) -> float:
 
 def per_t_pnl(values, y):
     """(T,) cupy。v=values−cs_mean;w=v/Σ|v|;out[t]=Σ w·y(v 与 y 都 finite 的 s)。
-    n_v==0 或 Σ|v|<1e-12 → 0。evaluator 唯一 D2H 的 (T,) 数组(喂 CPU 池 pnl_corr)。"""
-    fv = cp.isfinite(values)
-    vv = cp.where(fv, values, _F64(0))
-    n_v = fv.sum(1, dtype=_F64)
-    mean_v = vv.sum(1, dtype=_F64) / cp.maximum(n_v, 1)
-    dv = cp.where(fv, values - mean_v[:, None], _F64(0))
-    sum_abs = cp.abs(dv).sum(1, dtype=_F64)
-    y_safe = cp.where(fv & cp.isfinite(y), y, _F64(0))
-    pnl_num = (dv * y_safe).sum(1, dtype=_F64)
-    ok = (n_v > 0) & (sum_abs >= 1e-12)
-    return cp.where(ok, pnl_num / cp.maximum(sum_abs, 1e-300), _F64(0))
+    n_v==0 或 Σ|v|<1e-12 → 0。evaluator 唯一 D2H 的 (T,) 数组(喂 CPU 池 pnl_corr)。
+    **融合两轮归约核**(k_per_t_pnl)替原 ~7 遍整盘归约;f64 累加器同精度。"""
+    return k_per_t_pnl(values, y)

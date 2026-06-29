@@ -3,7 +3,7 @@ Alpha 表达式 AST(由 grammar 产生式构造)
 ==========================================
 
 节点形式:
-    Leaf:     ('operand', OperandToken)  或  ('const_add'|'const_mul', float)
+    Leaf:     ('operand', 列名 str)  或  ('const_add'|'const_mul', float)
     Internal: ('unary'|'cs', op, child)
               ('binary',     op, child_l, child_r)
               ('ts',         op, w, child)
@@ -25,10 +25,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from evaluation import grammar as _grammar
 from evaluation.grammar import (
-    BinaryOp, ConstBinaryOp, CsOp, OperandToken, PairOp, Production, TsOp, UnaryOp,
+    BinaryOp, ConstBinaryOp, CsOp, PairOp, Production, TsOp, UnaryOp,
     PRODUCTION_COSTS,
 )
+from markets.vocabulary import warmup_depth as _warmup_depth
 
 
 # ============================================================================
@@ -78,7 +80,7 @@ _COMMUTATIVE_PAIR: frozenset = frozenset({PairOp.TS_CORR, PairOp.TS_COV})
 class Node:
     """通用节点。kind+op+window 决定操作语义,children 是子树。"""
     kind: str                     # 'operand' | 'const_add' | 'const_mul' | 'unary' | 'cs' | 'binary' | 'binary_const' | 'ts' | 'pair'
-    op:   object                  # OperandToken / float / UnaryOp / CsOp / BinaryOp / TsOp / PairOp
+    op:   object                  # operand=列名 str / float / UnaryOp / CsOp / BinaryOp / TsOp / PairOp
     window: Optional[int] = None  # 只在 ts/pair 用
     children: Tuple['Node', ...] = ()
     hash:  int = 0                # 自底向上 Merkle hash(post-init 计算)
@@ -116,36 +118,8 @@ class Node:
         return n
 
 
-# operand 叶自身的 warmup 深度(bar 数):panel 构建端 rolling 列的窗长 + 派生 shift +
-# metrics 列 lag-1(adapter / live merge 同构)。raw kline / premium / funding / tenure = 1。
-# required_depth() 用:树最后一行非 NaN 需要的最小 panel 深度从叶往上累加。
-_OPERAND_WARMUP_DEPTH = {
-    OperandToken.SUM_OI:           2,    # metrics lag-1
-    OperandToken.SUM_OI_VALUE:     2,
-    OperandToken.COUNT_TOP_LSR:    2,
-    OperandToken.SUM_TOP_LSR:      2,
-    OperandToken.COUNT_LSR:        2,
-    OperandToken.SUM_TAKER_LSR:    2,
-    OperandToken.OI_LOG_RET:       3,    # shift(1) + lag-1
-    OperandToken.OI_CHG_48:        51,   # rolling48(oi_log_ret) + lag-1
-    OperandToken.OI_CHG_288:       291,
-    OperandToken.VPIN_12:          14,
-    OperandToken.KYLE_12:          14,
-    OperandToken.VOL_ZSCORE_288:   290,
-    OperandToken.TAKER_IMB_EMA_48: 50,
-    OperandToken.MA_DIST_48:       49,
-    OperandToken.MA_DIST_288:      289,
-    # 2026-06-24 新增多 horizon 动量/波动(trailing N 5m bar + shift;同 ma_dist 约定)。
-    # intra_*/body_pct/log_ret_oc/range_pct 为桶内 bar-local → 默认 warmup 1(不入表)。
-    OperandToken.RET_12:           13,
-    OperandToken.RET_48:           49,
-    OperandToken.RET_144:          145,
-    OperandToken.RET_288:          289,
-    OperandToken.RV_12:            14,
-    OperandToken.RV_48:            50,
-    OperandToken.RV_144:           146,
-    OperandToken.RV_288:           290,
-}
+# operand 叶 warmup 深度由 markets.vocabulary.warmup_depth(列名) 数据驱动派生
+# (列名尾部窗长 + 构造余量;raw/快照列=1),不再手工枚举每个 operand。
 
 
 # ============================================================================
@@ -190,20 +164,20 @@ class AlphaTree:
         return found
 
     def is_raw_price_wrapper(self) -> bool:
-        """True 当且仅当 tree 不含任何 ts_*/pair 时序 op,且所有 operand leaf 都是 OHLCV
-        (open/high/low/close/volume/quote_volume)。
+        """True 当且仅当 tree 不含任何 ts_*/pair 时序 op,且所有 operand leaf 都是 raw-level
+        (价 PRICE ∪ 量 VOLUME,由 active 词表自动分类:crypto = OHLC+volume/quote_volume+
+        number_of_trades+taker_buy_quote_volume)。
         这种 alpha 在 cs 截面上等价于 symbol identity 排序(BTC 永远高、DOGE 永远低),
-        承载不了时序信息 — 训练阶段应作 score=0 处理,防 policy 退化到 leaf wrapper。"""
-        _OHLCV = (OperandToken.OPEN, OperandToken.HIGH, OperandToken.LOW,
-                  OperandToken.CLOSE,
-                  OperandToken.VOLUME, OperandToken.QUOTE_VOLUME)
+        承载不了时序信息 — 训练阶段应作 score=0 处理,防 policy 退化到 leaf wrapper。
+        raw-level 集随 set_vocabulary() 动态变化(故运行时从 grammar.ACTIVE_VOCAB 取)。"""
+        raw_level = _grammar.ACTIVE_VOCAB.raw_level_names
         bad = False
         def walk(n: Node):
             nonlocal bad
             if bad: return
             if n.kind in ('ts', 'pair'):
                 bad = True; return
-            if n.kind == 'operand' and n.op not in _OHLCV:
+            if n.kind == 'operand' and n.op not in raw_level:
                 bad = True; return
             for c in n.children:
                 walk(c)
@@ -217,7 +191,7 @@ class AlphaTree:
         每次决策都整树 NaN→哑火 → 选池硬拒的依据。"""
         def walk(n: Node) -> int:
             if n.kind == 'operand':
-                return _OPERAND_WARMUP_DEPTH.get(n.op, 1)
+                return _warmup_depth(n.op)
             if n.kind in ('const_add', 'const_mul', 'window'):
                 return 0
             d = max(walk(c) for c in n.children)
@@ -240,7 +214,7 @@ class AlphaTree:
 
 def _pretty(n: Node) -> str:
     if n.kind == 'operand':
-        return n.op.name.lower()
+        return n.op
     if n.kind in ('const_add', 'const_mul'):
         return f'{n.op:g}'
     if n.kind in ('unary', 'cs'):
@@ -264,7 +238,7 @@ def _pretty(n: Node) -> str:
 def _to_dict(n: Node) -> dict:
     base = {'kind': n.kind}
     if n.kind == 'operand':
-        base['op'] = n.op.name
+        base['op'] = n.op                         # parquet 列名字符串
     elif n.kind in ('const_add', 'const_mul'):
         base['op'] = float(n.op)
     else:
@@ -281,7 +255,7 @@ def _from_dict(d: dict) -> Node:
     op_raw = d['op']
     w = d.get('w')
     if kind == 'operand':
-        op = OperandToken[op_raw]
+        op = op_raw                               # parquet 列名字符串 = operand 身份
     elif kind in ('const_add', 'const_mul'):
         op = float(op_raw)
     elif kind == 'unary':

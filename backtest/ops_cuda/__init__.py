@@ -40,6 +40,8 @@ _k_pair    = _MOD.get_function(f'k_pair_{_SFX}')
 _k_ema     = _MOD.get_function(f'k_ema_{_SFX}')
 _k_cs      = _MOD.get_function(f'k_cs_{_SFX}')
 _k_cs_rank = _MOD.get_function(f'k_cs_rank_{_SFX}')
+_k_per_t_ic  = _MOD.get_function(f'k_per_t_ic_{_SFX}')
+_k_per_t_pnl = _MOD.get_function(f'k_per_t_pnl_{_SFX}')
 _k_pair.max_dynamic_shared_size_bytes = _OPTIN    # pair=2 数组,大 w shared 到 optin(单数组核留 _SHBUDGET)
 
 _DUMMY = cp.zeros(1, dtype=DTYPE)        # kmode=0 占位(kernel 不解引用)
@@ -161,40 +163,75 @@ def cs_scale(x):  return _cs(x, 2)
 
 
 def cs_rank(d_x):
+    """逐 t 截面平均-rank ∈[0,1];n<2 整行 NaN。一 block 一 t,行入 shared,O(S²) count。
+    (2026-06-29:block-bitonic O(S log²S) 替代经 crypto/A股/美股三市真实 S(299-666)实测慢 8-12×,
+    真实列 tile 扫到 S=2048 仍慢 3.7×,crossover >S~3000 超出全部市场 universe——36-45 个 __syncthreads
+    屏障 + 串行 tie 尾压过渐近优势;O(S²) 满并行(近零屏障)在本引擎全 S 区间即最优 → 证否删除。)"""
     T, S = d_x.shape
     d_o = cp.empty_like(d_x)
     _k_cs_rank((T,), (256,), (d_x, d_o, np.int32(S)), shared_mem=S * _ELEM)
     return d_o
 
 
-# ===== elementwise / binary / binary_const(cupy ufunc,语义对齐 ops_elementwise.c)=====
-_NAN = cp.asarray(np.nan, dtype=DTYPE)
+# ===== metrics 融合核(逐 t 一 block,单遍 warp-shuffle 归约;metrics.py 调)=====
+def k_per_t_ic(x, y):
+    """逐 t Pearson IC → (T,) f64 常驻 cupy(替 metrics.py 多遍整盘 .sum 归约)。x,y 须 DTYPE 连续 (T,S)。"""
+    T, S = x.shape
+    o = cp.empty(T, dtype=cp.float64)
+    _k_per_t_ic((T,), (256,), (x, y, o, np.int32(S)))
+    return o
 
+
+def k_per_t_pnl(values, y):
+    """逐 t L1-norm signed PnL → (T,) f64 常驻 cupy(融合两轮归约核;values,y 须 DTYPE 连续 (T,S))。"""
+    T, S = values.shape
+    o = cp.empty(T, dtype=cp.float64)
+    _k_per_t_pnl((T,), (256,), (values, y, o, np.int32(S)))
+    return o
+
+
+# ===== elementwise / binary / binary_const =====
+# 算术/隐式-NaN 传播 op(abs/neg/square/tanh/add/sub/mul/max/min/add_const/mul_const)直接 cupy
+# ufunc(本就单核)。**带显式 NaN where-mask 的 op(sign/log/sqrt/inv/s_log_1p/div/pow_const)**原
+# 各是 3-7 个 cp.where/比较 ufunc 链 = 每 op 多次整盘全局读写 + 多张 (T,S) 临时盘;FACT 融合 →
+# 各塌成**单个 cp.ElementwiseKernel**(读一遍、1 launch、0 中间临时):标量 body 内联 NaN 语义,
+# 逐元素无 reduction → 不改累加序,落 GPU ~1e-6 容差(scripts/verify_fused 守门)。
+# body 模板 T = 输入 dtype(f32/f64),log/sqrt/pow/log1p/fabs 自动选对应重载。
 
 def abs_(x):    return cp.abs(x)
 def neg(x):     return -x
-def sign(x):    return cp.where(cp.isnan(x), _NAN, cp.sign(x))        # cupy sign(nan)=0 → 显式补 nan
 def square(x):  return x * x
 def tanh_(x):   return cp.tanh(x)
-def log(x):     return cp.where(x > 0, cp.log(cp.where(x > 0, x, 1)), _NAN)        # x<=0/nan → nan
-def sqrt_(x):   return cp.where(x >= 0, cp.sqrt(cp.where(x >= 0, x, 0)), _NAN)     # x<0/nan → nan
-def inv(x):     return cp.where(x == 0, _NAN, 1 / cp.where(x == 0, 1, x))          # x==0/nan → nan
-def s_log_1p(x):
-    r = cp.where(x >= 0, cp.log1p(cp.where(x >= 0, x, 0)), -cp.log1p(cp.where(x < 0, -x, 0)))
-    return cp.where(cp.isnan(x), _NAN, r)                            # 掩码会吞 nan → 末尾补回
-
-
 def add(a, b): return a + b
 def sub(a, b): return a - b
 def mul(a, b): return a * b
-def div(a, b): return cp.where(b == 0, _NAN, a / cp.where(b == 0, 1, b))           # b==0 → nan
 def max_b(a, b): return cp.maximum(a, b)                              # nan 任一 → nan
 def min_b(a, b): return cp.minimum(a, b)
-
-
 def add_const(x, k): return x + DTYPE(k)
 def mul_const(x, k): return x * DTYPE(k)
-def pow_const(x, k):
-    av = cp.abs(x)
-    p = cp.power(cp.where(av == 0, 1, av), DTYPE(k))
-    return cp.where(av == 0, cp.asarray(0, DTYPE), cp.copysign(p, x))  # signed power,0→0
+
+
+_k_sign     = cp.ElementwiseKernel('T x', 'T o',
+    'o = isnan(x) ? x : (x > (T)0 ? (T)1 : (x < (T)0 ? (T)-1 : (T)0));', 'fm_sign')
+_k_log      = cp.ElementwiseKernel('T x', 'T o',
+    'o = (isnan(x) || x <= (T)0) ? (T)nan("") : log(x);', 'fm_log')          # x<=0/nan → nan
+_k_sqrt     = cp.ElementwiseKernel('T x', 'T o',
+    'o = (isnan(x) || x < (T)0) ? (T)nan("") : sqrt(x);', 'fm_sqrt')         # x<0/nan → nan
+_k_inv      = cp.ElementwiseKernel('T x', 'T o',
+    'o = (isnan(x) || x == (T)0) ? (T)nan("") : (T)1 / x;', 'fm_inv')        # x==0/nan → nan
+_k_s_log_1p = cp.ElementwiseKernel('T x', 'T o',
+    'o = isnan(x) ? x : (x >= (T)0 ? log1p(x) : -log1p(-x));', 'fm_s_log_1p')
+_k_div      = cp.ElementwiseKernel('T a, T b', 'T o',
+    'o = (b == (T)0) ? (T)nan("") : a / b;', 'fm_div')                       # b==0 → nan(a/b 自然传 nan)
+_k_pow_const = cp.ElementwiseKernel('T x, T k', 'T o',
+    'T av = fabs(x); if (av == (T)0) { o = (T)0; } else { T p = pow(av, k); o = (x < (T)0) ? -p : p; }',
+    'fm_pow_const')                                                          # signed_power,0→0
+
+
+def sign(x):     return _k_sign(x)
+def log(x):      return _k_log(x)
+def sqrt_(x):    return _k_sqrt(x)
+def inv(x):      return _k_inv(x)
+def s_log_1p(x): return _k_s_log_1p(x)
+def div(a, b):   return _k_div(a, b)
+def pow_const(x, k): return _k_pow_const(x, DTYPE(k))

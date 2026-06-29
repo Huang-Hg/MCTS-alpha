@@ -53,6 +53,41 @@ class FactorMiningConfig:
     pool_capacity:   int = ini('factor_mining', 'pool_capacity', 24)
 
 
+_NEUTRALIZE_MODES = frozenset({'crowding', 'beta', 'market'})
+
+
+@dataclass(frozen=True)
+class NeutralizeConfig:
+    """统一中性化配置 —— 单一 INI 项 `[neutralize].neutralize`(逗号分隔启用项)。
+    研究 eval / val deploy / live signal **同源**。modes ⊆ {crowding, beta, market}:
+      crowding — 候选/信号 ⊥ 拥挤子空间(funding/lsr/基差/OI)
+      beta     — 信号 ⊥ 因果滚动市场 β(系统风险正交)
+      market   — dollar-neutral 多空平衡(Σw=0;门控 signal_to_weight 的 post-clip demean)
+    空 = 全关。非法模式名 → 大声崩(config 边界,信任前置条件)。"""
+    modes: frozenset = frozenset(
+        m for m in (s.strip().lower()
+                    for s in ini('neutralize', 'neutralize', 'beta,market').replace(',', ' ').split())
+        if m)
+
+    def __post_init__(self):
+        bad = self.modes - _NEUTRALIZE_MODES
+        if bad:
+            raise ValueError(f'未知中性化模式 {sorted(bad)};合法 = {sorted(_NEUTRALIZE_MODES)}'
+                             f'([neutralize].neutralize)')
+
+    @property
+    def crowding(self) -> bool:
+        return 'crowding' in self.modes
+
+    @property
+    def beta(self) -> bool:
+        return 'beta' in self.modes
+
+    @property
+    def market(self) -> bool:
+        return 'market' in self.modes
+
+
 @dataclass
 class AlphaSAGEConfig:
     """AlphaSAGE GFlowNet alpha-mining baseline(main.py train-alphasage 驱动,独立于 GP)。

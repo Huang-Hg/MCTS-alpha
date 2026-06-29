@@ -50,15 +50,14 @@ logging.basicConfig(
 )
 log = logging.info
 
-from config.config import FactorMiningConfig, ini
+from config.config import FactorMiningConfig, NeutralizeConfig, ini
 from backtest import ops
 from evaluation.adapter import load_panel, month_iter, split_train_val
 from evaluation.ast import AlphaTree
 from evaluation.expression import evaluate as eval_tree
-from evaluation.grammar import OperandToken
 from rl.alpha_pool import AlphaPool
 from rl.backtest_reward import BacktestRewardConfig
-from rl.evaluator import _DEVICE as _EVAL_DEVICE, EvalConfig, evaluate_alpha
+from rl.evaluator import _DEVICE as _EVAL_DEVICE
 from backtest.ops import cs_zscore_np, icir
 from evaluation.cache import EvalCache
 
@@ -95,7 +94,7 @@ def prepare_gp_data(train_start: str, train_end: str, val_start: str, val_end: s
     _T_train_rows = len(_tr_idx)
     train_panels, train_y, val_panels, val_y = split_train_val(bundle)
     # val 5m 价路径(run_bt;须在 val_panels 降 1h 前取)
-    val_close_TS = prepare_close_TS(val_panels[OperandToken.CLOSE])
+    val_close_TS = prepare_close_TS(val_panels['close'])
     val_open_TS  = prepare_open_TS(bundle.opens[_va_sl])
     val_fund_TS  = bundle.funding_rate[_va_sl].copy()
     val_vol_TS   = bundle.slippage_vol[_va_sl].copy()
@@ -127,12 +126,12 @@ def eval_pool_val(pool, data: Dict[str, Any], bcfg) -> Tuple[float, float]:
     from rl.backtest_reward import run_bt, broadcast_dec_to_5m
     from rl.sizing import (topk_ls_weights, beta_neutralize, aff_fuse,
                            crowding_neutralize, build_crowding_basis, _CROWD_TOKENS)
-    from rl.evaluator import EvalConfig
     if not pool.members:
         return 0.0, 0.0
+    nc = NeutralizeConfig()                      # 统一中性化单一源
     vd = data['val_dec']; n_dec = len(vd)
     valid_dec = data['val_valid'][::12][:n_dec]
-    crowd = EvalConfig().crowding_neutral
+    crowd = nc.crowding
     gz = (build_crowding_basis({t: np.ascontiguousarray(data['val_panels'][t], dtype=np.float64)[vd]
                                 for t in _CROWD_TOKENS}) if crowd else None)
     member_z = []
@@ -143,8 +142,9 @@ def eval_pool_val(pool, data: Dict[str, Any], bcfg) -> Tuple[float, float]:
     # AFF 自适应融合(因果滚动 lstsq;取代静态 ICIR 加权 —— 2026-06-26 实证大胜弱方向因子);短窗自适应 warmup
     ens = aff_fuse(mz, data['val_y_dec'], valid_dec, warmup=min(480, n_dec // 4))
     _, pool_ic, _ = icir(ens, data['val_y_dec'])
-    close_dec = np.ascontiguousarray(data['val_panels'][OperandToken.CLOSE], dtype=np.float64)[vd]
-    ens = beta_neutralize(ens, close_dec, valid_dec)                           # 动态 β 中性(系统风险正交)
+    close_dec = np.ascontiguousarray(data['val_panels']['close'], dtype=np.float64)[vd]
+    if nc.beta:
+        ens = beta_neutralize(ens, close_dec, valid_dec)                      # 动态 β 中性(系统风险正交)
     w_dec = topk_ls_weights(ens, valid_dec, bcfg.top_k, bcfg.swap_n, bcfg.min_hold, leverage_cap=1.0)
     sig5m = broadcast_dec_to_5m(w_dec, data['val_close_TS'].shape[0])
     res = run_bt(sig5m, data['val_close_TS'], data['val_open_TS'], data['val_qvol_TS'],
@@ -184,6 +184,77 @@ def cmd_gp_baseline(output: str) -> None:
     n_lib = append_run(collected, lib_path, ini('alpha_library', 'corr_max', 0.5),
                        int(ini('alpha_library', 'max_size', 500)), run_ts)
     log(f"[gp-baseline] alpha library += {n_lib}(within-run 正交)→ {lib_path}")
+
+
+# ============================================================================
+# gp-equity / gp-ashare — 日线权益类(美股 / A 股)IC 挖矿:复用 GP NSGA-II(reward=|rank_ic|),
+#   切对应市场词表(OHLCV 5 operand)。panels=复权 OHLC + volume(NaN-as-missing,cs 算子 NaN-aware);
+#   y=因果 h-日前向收益。crowding-neutral 关(权益无 funding/OI 拥挤面板);无 5m→1h 降采样(日线直用)。
+#   US/A 股 panel 同 EquityPanel 结构 → 切分/挖矿/落地全共享,仅 loader + 市场标签不同。
+# ============================================================================
+
+def _equity_like_gp_split(panel, val_frac: float):
+    """EquityPanel(美股/A 股)→ (train_panels, train_y, full_panels, val_y, n_train) + set 词表。
+    **切 panel**(非 label-mask):train 喂前 (1−val_frac) 行切片 → 池内置 holdout OOS 门(末 holdout_frac
+    per_t_pnl)落在 train 内有信号段,**避免与外部 val 重合致 per_t_pnl 末段清零 → 池全空**;train 末 h 行
+    purge(前向探入 val)。val:全 panel 算因子(warmup 完整、因果),仅 score 末 val_frac 行(train 段 NaN)。
+    切片对 ts 因子精确(因果 → factor[t<n_train] 只依赖 ≤t 行)。"""
+    from markets.vocabulary import from_columns
+    from evaluation.grammar import set_vocabulary, set_windows
+    full_panels = {c: np.ascontiguousarray(panel.adj_ohlc[c], dtype=np.float64)
+                   for c in ('open', 'high', 'low', 'close')}
+    full_panels['volume'] = np.ascontiguousarray(panel.raw['volume'], dtype=np.float64)
+    y = np.ascontiguousarray(panel.fwd_ret, dtype=np.float64)
+    T, h = panel.shape[0], panel.fwd_horizon
+    n_train = int(T * (1.0 - val_frac))
+    train_panels = {k: np.ascontiguousarray(v[:n_train]) for k, v in full_panels.items()}
+    train_y = np.ascontiguousarray(y[:n_train].copy()); train_y[n_train - h:] = np.nan   # purge gap
+    val_y = y.copy();   val_y[:n_train] = np.nan              # val 仅 score 末段(全 panel 上算因子)
+    set_vocabulary(from_columns(list(full_panels.keys()), name=panel.profile.name))   # OHLC→PRICE, volume→VOLUME
+    set_windows(panel.profile.windows)            # 日线窗集(3..240 交易日),替 crypto 1h 窗 → rebuild_pset 同步
+    return train_panels, train_y, full_panels, val_y, n_train
+
+
+def _run_equity_like_mining(panel, tag: str, output: str, val_frac: float = 0.25) -> None:
+    """美股/A 股共享挖矿:切 panel → GP(reward=|rank_ic|,train 切片;池内 holdout OOS 门)→ 末段
+    val OOS |IC|(全 panel 算因子)→ alpha pool JSON。中性化由 [evaluator]·[neutralize] 派发。"""
+    os.environ['ARROW_DEFAULT_MEMORY_POOL'] = 'system'
+    from search.gp.gp_baseline import run_gp
+    fm = FactorMiningConfig()
+    train_panels, train_y, full_panels, val_y, n_train = _equity_like_gp_split(panel, val_frac)
+    T = panel.shape[0]
+    log(f"[{tag}] {panel.profile.name} panel T={T} S={panel.shape[1]} "
+        f"dates {panel.dates[0]}..{panel.dates[-1]} fwd_h={panel.fwd_horizon} | "
+        f"split train[:{n_train}] val[{n_train}:] (OOS)")
+    log(f"[{tag}] ⚠️ universe:纳入前视由建 parquet 阶段 PIT 过滤消除(parquet 即 PIT-correct,本步只读);"
+        f"幸存者偏差仅当 pull 按 membership union 拉含退市名才消(当期成分套全历史时仍在)→ IC 仍偏乐观")
+    pool, collected = run_gp(train_panels, train_y, capacity=fm.pool_capacity, seed=42, log=log)
+    val_ics = [abs(float(ops.rank_ic(
+        np.ascontiguousarray(eval_tree(m.tree, full_panels, None), dtype=np.float64), val_y)))
+        for m in pool.members]
+    val_ic = float(np.mean(val_ics)) if val_ics else 0.0
+    log(f"[{tag}] pool_size={pool.size} collected={len(collected)} val_mean|IC|={val_ic:+.4f}(OOS)")
+    run_ts = os.environ.get('RUN_TS') or time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    snap = Path(f'logs/{tag.replace("-", "_")}_pool_{run_ts}.jsonl')
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    with open(snap, 'w', encoding='utf-8') as f:
+        f.write(json.dumps({'pool': pool.to_jsonable(), 'collected': len(collected),
+                            'val_mean_abs_ic': val_ic}, ensure_ascii=False) + '\n')
+    with open(output, 'w', encoding='utf-8') as f:
+        json.dump({'pool': pool.to_jsonable()}, f, ensure_ascii=False, indent=2)
+    log(f"[{tag}] deploy bundle → {output};snapshot → {snap}")
+
+
+def cmd_gp_equity(output: str) -> None:
+    """US 权益(日线)IC 挖矿。只读 panel.parquet(PIT 成分已在建 parquet 阶段 bake)。"""
+    from data.us_equity_panel import load_us_equity_panel
+    _run_equity_like_mining(load_us_equity_panel(), 'gp-equity', output)
+
+
+def cmd_gp_ashare(output: str) -> None:
+    """中国 A 股(日线)IC 挖矿。只读 panel.parquet(PIT 成分已在建 parquet 阶段 bake)。"""
+    from data.a_share_panel import load_a_share_panel
+    _run_equity_like_mining(load_a_share_panel(), 'gp-ashare', output)
 
 
 # ============================================================================
@@ -295,6 +366,12 @@ def main(argv=None):
     pg = sub.add_parser('gp-baseline', help='DEAP 强类型 GP 因子挖掘(NSGA-II;产 alpha pool JSON)')
     pg.add_argument('output', help='deploy bundle JSON 路径')
 
+    pge = sub.add_parser('gp-equity', help='US 权益(日线)IC 挖矿(GP NSGA-II;产 alpha pool JSON)')
+    pge.add_argument('output', help='deploy bundle JSON 路径')
+
+    pga = sub.add_parser('gp-ashare', help='中国 A 股(日线)IC 挖矿(GP NSGA-II;产 alpha pool JSON)')
+    pga.add_argument('output', help='deploy bundle JSON 路径')
+
     pas = sub.add_parser('alphasage', help='AlphaSAGE GFlowNet 因子挖掘(独立 baseline;产 alpha pool JSON)')
     pas.add_argument('output', help='deploy bundle JSON 路径')
 
@@ -305,6 +382,10 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.cmd == 'gp-baseline':
         cmd_gp_baseline(args.output)
+    elif args.cmd == 'gp-equity':
+        cmd_gp_equity(args.output)
+    elif args.cmd == 'gp-ashare':
+        cmd_gp_ashare(args.output)
     elif args.cmd == 'alphasage':
         cmd_alphasage(args.output)
     else:

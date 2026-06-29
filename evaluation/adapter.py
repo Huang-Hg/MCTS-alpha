@@ -4,7 +4,7 @@
 
 输出:
     PanelBundle:
-        panels:        dict[OperandToken -> (T,S) float64 C-contiguous]
+        panels:        dict[列名 str -> (T,S) float64 C-contiguous]
         y_future:      (T, S) float64,future log-return at primary horizon
         timestamps:    pd.DatetimeIndex (length T,UTC)
         symbols:       list[str] (length S)
@@ -35,7 +35,7 @@ import pandas as pd
 
 from config.config import ini
 from evaluation import universe as univ
-from evaluation.grammar import OPERAND_COLUMNS, OperandToken
+from markets.vocabulary import CRYPTO_PARQUET_COLUMNS
 
 # parquet 月文件读并行度:pyarrow 读时释放 GIL → ThreadPool 近线性 overlap I/O。
 # Pass2 瞬时 transient(每 worker 一个月 df)~百 MB 级,远低于 panels_full 常驻。
@@ -57,7 +57,7 @@ DEFAULT_LEAD_DAYS: int = 2                  # 暖机窗口前置天数
 
 @dataclass
 class PanelBundle:
-    panels: Dict[OperandToken, np.ndarray]   # 每个 operand 的 (T, S) 面板
+    panels: Dict[str, np.ndarray]   # 每个 operand 的 (T, S) 面板
     y_future: np.ndarray                      # (T, S) future log-return
     timestamps: pd.DatetimeIndex              # 长度 T
     symbols: List[str]                        # 长度 S
@@ -139,7 +139,7 @@ def load_panel(
     months = month_iter(pre_start, full_end)
 
     needed_cols = ['decision_time', 'symbol',
-                   'close', 'open', 'high', 'low', 'quote_volume', 'intra_rv'] + list(OPERAND_COLUMNS.values())
+                   'close', 'open', 'high', 'low', 'quote_volume', 'intra_rv'] + list(CRYPTO_PARQUET_COLUMNS)
     needed_cols = list(dict.fromkeys(needed_cols))
     panel_cols = [c for c in needed_cols if c not in ('decision_time', 'symbol')]
 
@@ -304,7 +304,7 @@ def load_panel(
     print(f'[adapter] member_mask: per-bar holdable mean={member_mask.sum(1).mean():.1f}/{len(kept_syms)}',
           flush=True)
     del holdable_kept
-    # close/open/high/low/quote_volume/intra_rv 同时是 operand 列(进 OPERAND_COLUMNS)和 bt 辅助列,
+    # close/open/high/low/quote_volume/intra_rv 同时是 operand 列(进 panels)和 bt 辅助列,
     # 复用同一份 ndarray 引用,无 copy(intra_rv 2026-06-24 起也作 operand,故不再 pop)。
     close_panel       = panels_full['close']
     open_panel_full   = panels_full['open']
@@ -321,8 +321,9 @@ def load_panel(
     train_idx = (t_arr >= train_lo_ns) & (t_arr < train_hi_ns)
 
     # panels_full 由 np.full 直接预分配 → 已 C-contig,ascontiguousarray 是 no-op view,无 copy。
-    panels_arr: Dict[OperandToken, np.ndarray] = {
-        tok: panels_full[col] for tok, col in OPERAND_COLUMNS.items()
+    # panels 键 = parquet 列名(= operand 身份);tenure_norm 为合成 operand 另行注入。
+    panels_arr: Dict[str, np.ndarray] = {
+        c: panels_full[c] for c in CRYPTO_PARQUET_COLUMNS
     }
 
     # ---------- metrics 因果对齐:发布延迟统一 lag-1 ----------
@@ -330,11 +331,11 @@ def load_panel(
     # vision zip 落终值 → 不 shift 即默认偷看未来发布。live 端 panel lag-1 merge 后,
     # 此处同构 shift 使训练/回测与 live 决策因果严格一致(全列统一 lag-1,不为 taker 开特例)。
     # 派生列(oi_log_ret/oi_chg_N)对全局 shift 与"先 shift raw 再重算"严格交换,直接 shift。
-    for tok in (OperandToken.SUM_OI, OperandToken.SUM_OI_VALUE,
-                OperandToken.OI_LOG_RET, OperandToken.OI_CHG_48, OperandToken.OI_CHG_288,
-                OperandToken.COUNT_TOP_LSR, OperandToken.SUM_TOP_LSR,
-                OperandToken.COUNT_LSR, OperandToken.SUM_TAKER_LSR):
-        arr = panels_arr[tok]
+    for c in ('sum_oi', 'sum_oi_value',
+              'oi_log_ret', 'oi_chg_48', 'oi_chg_288',
+              'count_top_lsr', 'sum_top_lsr',
+              'count_lsr', 'sum_taker_lsr'):
+        arr = panels_arr[c]
         arr[1:, :] = arr[:-1, :]              # numpy 重叠赋值自带 overlap 检测,安全
         arr[:1, :] = np.nan
     open_panel = open_panel_full
@@ -348,12 +349,12 @@ def load_panel(
     # tenure = 连续 qvol>0 的 bar 数(run-length);qvol==0(未上市/掉出 top-30)处重置归零。
     # = exp(−tenure/288):tenure=1→0.997,1d(288)→0.368,3d→0.05。把"刚进 top-30"显式成
     # 可挖矿特征(此前经 universe membership 隐式入)。
-    # 未上市处置 NaN(与其它 operand 同约定:cs 算子 NaN-safe 自动排除)。非 OPERAND_COLUMNS(派生)。
+    # 未上市处置 NaN(与其它 operand 同约定:cs 算子 NaN-safe 自动排除)。合成 operand(无 parquet 列)。
     _idx = np.arange(total_t, dtype=np.int64)[:, None]
     _last_out = np.maximum.accumulate(np.where(qvol_panel > 0.0, -1, _idx), axis=0)
     _tenure = (_idx - _last_out).astype(np.float64)
-    panels_arr[OperandToken.TENURE_NORM] = np.where(qvol_panel > 0.0,
-                                                    np.exp(_tenure / -288.0), np.nan).astype(np.float32)
+    panels_arr['tenure_norm'] = np.where(qvol_panel > 0.0,
+                                         np.exp(_tenure / -288.0), np.nan).astype(np.float32)
     del _idx, _last_out, _tenure
 
     # ---------- future return ----------
@@ -439,7 +440,7 @@ def _load_funding(months: List[str], timestamps: pd.DatetimeIndex,
 # ============================================================================
 
 def split_train_val(bundle: PanelBundle
-) -> Tuple[Dict[OperandToken, np.ndarray], np.ndarray, Dict[OperandToken, np.ndarray], np.ndarray]:
+) -> Tuple[Dict[str, np.ndarray], np.ndarray, Dict[str, np.ndarray], np.ndarray]:
     """train/val 拆分,两段各独立 anon 拷贝。
 
     train 段拷贝供局级 worker fork COW 共享;两段都 .copy():连续行切片 view 已 C-contig,
@@ -452,8 +453,8 @@ def split_train_val(bundle: PanelBundle
     tr_sl = slice(int(tr_idx[0]), int(tr_idx[-1]) + 1)
     va_sl = slice(int(va_idx[0]), int(va_idx[-1]) + 1)
 
-    train_panels: Dict[OperandToken, np.ndarray] = {}
-    val_panels:   Dict[OperandToken, np.ndarray] = {}
+    train_panels: Dict[str, np.ndarray] = {}
+    val_panels:   Dict[str, np.ndarray] = {}
     for tok in list(bundle.panels):
         full = bundle.panels.pop(tok)
         train_panels[tok] = full[tr_sl].copy()
@@ -465,7 +466,7 @@ def split_train_val(bundle: PanelBundle
     return train_panels, train_y, val_panels, val_y
 
 
-def slice_bundle(bundle: PanelBundle, mask: np.ndarray) -> Tuple[Dict[OperandToken, np.ndarray], np.ndarray]:
+def slice_bundle(bundle: PanelBundle, mask: np.ndarray) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
     """返回 (panels_subset, y_subset)。panels_subset 与 y_subset 都为 mask 区间的连续切片。
     若 mask 不是连续区间(比如 train+val 之间有 hole),用 fancy indexing(会拷贝)。
     """

@@ -3,7 +3,7 @@ AST 求值:把 AlphaTree 在 (T, S) 面板上算成一张同形 ndarray。**块�
 
 调用约定:
     evaluate(tree, panels, cache=None) -> np.ndarray (T, S) float64
-        panels: dict[OperandToken -> ndarray (T, S)](f64 或 f32,f32 按块升格)
+        panels: dict[列名 str -> ndarray (T, S)](f64 或 f32,f32 按块升格)
         cache:  EvalCache(hash → 整列 ndarray)或 None;命中直接返回
 
 执行模型(空间复杂度优化,时间复杂度不变):
@@ -33,7 +33,7 @@ from config.config import ini
 from backtest import ops
 from evaluation.ast import AlphaTree, Node
 from evaluation.grammar import (
-    BinaryOp, ConstBinaryOp, CsOp, OperandToken, PairOp, TsOp, UnaryOp,
+    BinaryOp, ConstBinaryOp, CsOp, PairOp, TsOp, UnaryOp,
 )
 
 # 求值后端:cpu=块化 C 执行器(本文件上半);cuda=全panel常驻 GPU 执行器(本文件下半,lazy)。
@@ -182,7 +182,7 @@ class _BlockPool:
 _RANGE_CACHE: Dict[int, tuple] = {}
 
 
-def _compute_ranges(panels: Dict[OperandToken, np.ndarray]):
+def _compute_ranges(panels: Dict[str, np.ndarray]):
     arrs = list(panels.values())
     T, S = arrs[0].shape
     vlo = np.full(S, T, dtype=np.int64)
@@ -197,7 +197,7 @@ def _compute_ranges(panels: Dict[OperandToken, np.ndarray]):
     return np.ascontiguousarray(vlo), np.ascontiguousarray(vhi)
 
 
-def _col_ranges(panels: Dict[OperandToken, np.ndarray]):
+def _col_ranges(panels: Dict[str, np.ndarray]):
     key = id(panels)
     sentinel = next(iter(panels.values()))
     hit = _RANGE_CACHE.get(key)
@@ -210,7 +210,7 @@ def _col_ranges(panels: Dict[OperandToken, np.ndarray]):
 
 def evaluate(
     tree: AlphaTree,
-    panels: Dict[OperandToken, np.ndarray],
+    panels: Dict[str, np.ndarray],
     cache=None,
 ) -> np.ndarray:
     """求值整树,返回 (T, S) ndarray。cache 须为 EvalCache(bump 准入)或 None。"""
@@ -219,7 +219,7 @@ def evaluate(
     return _eval_full(tree.root, panels, cache, _col_ranges(panels))
 
 
-def _eval_full(n: Node, panels: Dict[OperandToken, np.ndarray], cache, ranges=None, force_store: bool = False) -> np.ndarray:
+def _eval_full(n: Node, panels: Dict[str, np.ndarray], cache, ranges=None, force_store: bool = False) -> np.ndarray:
     """物化一个节点为整列 (T, S) 数组:cs / 链根 / 热内点走这里。
     入库同样走 bump≥2 准入(pack 有成本 ~60-90ms/条,一次性 root/cs 不值得占 LRU);
     force_store = 热内点(_prepare 已证复用,直接入)。"""
@@ -281,7 +281,7 @@ def _eval_full(n: Node, panels: Dict[OperandToken, np.ndarray], cache, ranges=No
     return result
 
 
-def _prepare(n: Node, panels: Dict[OperandToken, np.ndarray], cache, vleaves: Dict[int, np.ndarray], ranges=None) -> None:
+def _prepare(n: Node, panels: Dict[str, np.ndarray], cache, vleaves: Dict[int, np.ndarray], ranges=None) -> None:
     """链根以下的 colwise 子树扫描:把必须整列存在的节点解析成虚拟叶。
     虚拟叶 = cs 子结果 | cache 命中的内点 | 二次使用(bump≥2)的热内点。
     其余内点留给 _eval_block 按块流式算,不物化。"""
@@ -311,7 +311,7 @@ def _prepare(n: Node, panels: Dict[OperandToken, np.ndarray], cache, vleaves: Di
 
 def _eval_block(
     n: Node,
-    panels: Dict[OperandToken, np.ndarray],
+    panels: Dict[str, np.ndarray],
     vleaves: Dict[int, np.ndarray],
     pool: _BlockPool,
     j0: int,
@@ -416,11 +416,13 @@ _GY_CACHE: Dict[int, tuple] = {}              # id(y_future) → (y_future, cupy
 
 
 class _GpuState:
-    __slots__ = ('cp', 'gops', 'unary', 'binary', 'const_bin', 'cs', 'ts', 'pair')
+    # unary/binary/const_bin 分发表已删:rank4 起 elementwise 走 _gpu_eval_fused 的 codegen(不再逐 op 分发)。
+    __slots__ = ('cp', 'gops', 'cs', 'ts', 'pair')
 
 
 def _gpu_init() -> '_GpuState':
-    """首次 cuda 求值时构建 cupy/ops_cuda 句柄 + GPU 算子分发表(之后零成本复用)。"""
+    """首次 cuda 求值时构建 cupy/ops_cuda 句柄 + 屏障算子分发表(cs/ts/pair;之后零成本复用)。
+    elementwise(unary/binary/binary_const)不进分发表 → 运行时 codegen 融合核(_gpu_eval_fused)。"""
     global _GPU
     if _GPU is not None:
         return _GPU
@@ -429,19 +431,6 @@ def _gpu_init() -> '_GpuState':
     st = _GpuState()
     st.cp = cp
     st.gops = gops
-    st.unary = {
-        UnaryOp.ABS: gops.abs_, UnaryOp.NEG: gops.neg, UnaryOp.SIGN: gops.sign,
-        UnaryOp.LOG: gops.log, UnaryOp.SQUARE: gops.square, UnaryOp.SQRT: gops.sqrt_,
-        UnaryOp.TANH: gops.tanh_, UnaryOp.INV: gops.inv, UnaryOp.S_LOG_1P: gops.s_log_1p,
-    }
-    st.binary = {
-        BinaryOp.ADD: gops.add, BinaryOp.SUB: gops.sub, BinaryOp.MUL: gops.mul,
-        BinaryOp.DIV: gops.div, BinaryOp.MAX: gops.max_b, BinaryOp.MIN: gops.min_b,
-    }
-    st.const_bin = {
-        ConstBinaryOp.ADD_CONST: gops.add_const, ConstBinaryOp.MUL_CONST: gops.mul_const,
-        ConstBinaryOp.POW_CONST: gops.pow_const,
-    }
     st.cs = {
         CsOp.CS_RANK: gops.cs_rank, CsOp.CS_ZSCORE: gops.cs_zscore,
         CsOp.CS_DEMEAN: gops.cs_demean, CsOp.CS_SCALE: gops.cs_scale,
@@ -459,7 +448,7 @@ def _gpu_init() -> '_GpuState':
     return _GPU
 
 
-def _gpanels(panels: Dict[OperandToken, np.ndarray]):
+def _gpanels(panels: Dict[str, np.ndarray]):
     """panels 一次 H2D 常驻,按 id 缓存(sentinel 身份校验防 id 复用),整 run 复用。"""
     g = _gpu_init()
     key = id(panels)
@@ -472,6 +461,94 @@ def _gpanels(panels: Dict[OperandToken, np.ndarray]):
     return gp
 
 
+# ----------------------------------------------------------------------------
+# rank4 — GPU 极大 elementwise 子树融合(FACT compositional kernel synthesis)
+# ----------------------------------------------------------------------------
+# _gpu_eval 命中 elementwise 节点(unary/binary/binary_const)→ 不逐节点物化整盘,而是切出以
+# operand 叶 / const 字面量 / 屏障(ts/pair/cs)输出为界的**极大 elementwise 连通区**,codegen 成
+# 单个 cp.ElementwiseKernel(读叶+写根一遍,内部边整盘往返全消;DAG-CSE 按 node.hash 去重同子树)。
+# body 串(operand→positional in_param、const→字面量、屏障→positional in_param)即结构签名 → 按 body
+# 缓存编译核:不同 operand 绑定 / 不同公式同结构复用同核(GP 树被屏障切碎 → elementwise 区小而高频
+# 复现 → 缓存命中主导,摊掉 NVRTC 编译)。峰值显存逐节点 O(树)×整盘 → 区内 O(1)(本地 T1000 4GB 消
+# OOM)。逐元素无 reduction → 不改累加序,落 GPU ~1e-6(scripts/verify_fused 守门)。NaN 语义逐字复刻
+# ops_cuda 标量核(abs/neg/square/tanh 靠 IEEE 传播免守卫,sign/log/sqrt/inv/s_log_1p/div/max/min/
+# pow_const 显式内联)。
+_FUSED_KERNEL_CACHE: Dict[str, object] = {}     # body_str -> cp.ElementwiseKernel
+_ELEMENTWISE_KINDS = frozenset(('unary', 'binary', 'binary_const'))
+
+_UNARY_EXPR = {
+    UnaryOp.ABS:      lambda a: f'fabs({a})',
+    UnaryOp.NEG:      lambda a: f'-({a})',
+    UnaryOp.SQUARE:   lambda a: f'({a})*({a})',
+    UnaryOp.TANH:     lambda a: f'tanh({a})',
+    UnaryOp.SIGN:     lambda a: f'(isnan({a}) ? ({a}) : (({a}) > (T)0 ? (T)1 : (({a}) < (T)0 ? (T)-1 : (T)0)))',
+    UnaryOp.LOG:      lambda a: f'((isnan({a}) || ({a}) <= (T)0) ? (T)nan("") : log({a}))',
+    UnaryOp.SQRT:     lambda a: f'((isnan({a}) || ({a}) < (T)0) ? (T)nan("") : sqrt({a}))',
+    UnaryOp.INV:      lambda a: f'((isnan({a}) || ({a}) == (T)0) ? (T)nan("") : (T)1 / ({a}))',
+    UnaryOp.S_LOG_1P: lambda a: f'(isnan({a}) ? ({a}) : (({a}) >= (T)0 ? log1p({a}) : -log1p(-({a}))))',
+}
+_BINARY_EXPR = {
+    BinaryOp.ADD: lambda a, b: f'(({a}) + ({b}))',
+    BinaryOp.SUB: lambda a, b: f'(({a}) - ({b}))',
+    BinaryOp.MUL: lambda a, b: f'(({a}) * ({b}))',
+    BinaryOp.DIV: lambda a, b: f'((({b}) == (T)0) ? (T)nan("") : ({a}) / ({b}))',
+    BinaryOp.MAX: lambda a, b: f'((isnan({a}) || isnan({b})) ? (T)nan("") : (({a}) > ({b}) ? ({a}) : ({b})))',
+    BinaryOp.MIN: lambda a, b: f'((isnan({a}) || isnan({b})) ? (T)nan("") : (({a}) < ({b}) ? ({a}) : ({b})))',
+}
+_CONST_EXPR = {
+    ConstBinaryOp.ADD_CONST: lambda a, k: f'(({a}) + (T)({k}))',
+    ConstBinaryOp.MUL_CONST: lambda a, k: f'(({a}) * (T)({k}))',
+    ConstBinaryOp.POW_CONST: lambda a, k: f'(fabs({a}) == (T)0 ? (T)0 : (({a}) < (T)0 ? -pow(fabs({a}), (T)({k})) : pow(fabs({a}), (T)({k}))))',
+}
+
+
+def _emit_node(n: Node, inputs, input_index, temps, lines) -> str:
+    """post-order codegen:返回节点在 body 里的引用串(positional in_param / temp / 字面量)。
+    operand 与屏障(ts/pair/cs)= 输入边界(按 hash dedup → CSE);const = 内联字面量;
+    elementwise 内点 = 一条 `T t? = expr;`(按 hash dedup → DAG-CSE)。"""
+    k = n.kind
+    if k == 'operand' or k in ('ts', 'pair', 'cs'):
+        name = input_index.get(n.hash)
+        if name is None:
+            name = f'in{len(inputs)}'
+            input_index[n.hash] = name
+            inputs.append(n)
+        return name
+    if k in ('const_add', 'const_mul'):
+        return f'(T)({float(n.op)!r})'
+    name = temps.get(n.hash)
+    if name is not None:
+        return name
+    if k == 'unary':
+        expr = _UNARY_EXPR[n.op](_emit_node(n.children[0], inputs, input_index, temps, lines))
+    elif k == 'binary':
+        a = _emit_node(n.children[0], inputs, input_index, temps, lines)
+        b = _emit_node(n.children[1], inputs, input_index, temps, lines)
+        expr = _BINARY_EXPR[n.op](a, b)
+    else:  # binary_const:children[0]=panel,children[1]=const 叶(.op=k)
+        a = _emit_node(n.children[0], inputs, input_index, temps, lines)
+        expr = _CONST_EXPR[n.op](a, repr(float(n.children[1].op)))
+    name = f't{len(temps)}'
+    temps[n.hash] = name
+    lines.append(f'T {name} = {expr};')
+    return name
+
+
+def _gpu_eval_fused(n: Node, panels):
+    """融合 n 为根的极大 elementwise 区为单 ElementwiseKernel,输入(operand/屏障)先递归求值。"""
+    g = _GPU
+    inputs, input_index, temps, lines = [], {}, {}, []
+    root_ref = _emit_node(n, inputs, input_index, temps, lines)
+    body = ' '.join(lines) + f' o = {root_ref};'
+    kern = _FUSED_KERNEL_CACHE.get(body)
+    if kern is None:
+        in_params = ', '.join(f'T in{i}' for i in range(len(inputs)))
+        kern = g.cp.ElementwiseKernel(in_params, 'T o', body, 'fm_fused')
+        _FUSED_KERNEL_CACHE[body] = kern
+    args = [_gpu_eval(c, panels) for c in inputs]
+    return kern(*args)
+
+
 def _gpu_eval(n: Node, panels):
     g = _GPU
     k = n.kind
@@ -480,12 +557,8 @@ def _gpu_eval(n: Node, panels):
     if k in ('const_add', 'const_mul'):
         ref = next(iter(panels.values()))
         return g.cp.full(ref.shape, g.gops.DTYPE(n.op), dtype=g.gops.DTYPE)
-    if k == 'unary':
-        return g.unary[n.op](_gpu_eval(n.children[0], panels))
-    if k == 'binary':
-        return g.binary[n.op](_gpu_eval(n.children[0], panels), _gpu_eval(n.children[1], panels))
-    if k == 'binary_const':
-        return g.const_bin[n.op](_gpu_eval(n.children[0], panels), float(n.children[1].op))
+    if k in _ELEMENTWISE_KINDS:
+        return _gpu_eval_fused(n, panels)        # rank4:整段 elementwise 子树融成单核
     if k == 'cs':
         return g.cs[n.op](_gpu_eval(n.children[0], panels))
     if k == 'ts':
@@ -495,14 +568,14 @@ def _gpu_eval(n: Node, panels):
     raise ValueError(f'unknown kind {k}')
 
 
-def _gpu_evaluate(tree: AlphaTree, panels: Dict[OperandToken, np.ndarray], cache=None) -> np.ndarray:
+def _gpu_evaluate(tree: AlphaTree, panels: Dict[str, np.ndarray], cache=None) -> np.ndarray:
     """整树 GPU 求值,链根 D2H 回 numpy f64(evaluate() 在 device=cuda 时调本函数)。"""
     gp = _gpanels(panels)
     res = _gpu_eval(tree.root, gp)
     return _GPU.cp.asnumpy(res).astype(np.float64, copy=False)
 
 
-def evaluate_resident(tree: AlphaTree, panels: Dict[OperandToken, np.ndarray]):
+def evaluate_resident(tree: AlphaTree, panels: Dict[str, np.ndarray]):
     """返回**常驻 cupy** (T,S),不 D2H —— device=cuda 评分路径用(因子留显存,直接喂 GPU 度量,
     消灭每候选 1776MB D2H)。下游 ops_cuda.metrics 消费此 cupy handle。"""
     return _gpu_eval(tree.root, _gpanels(panels))

@@ -330,15 +330,11 @@ def build_5m_for_month(
 # (右沿 = 决策点 → row k 只含 ≤ dec5m[k] 的数据),与当前"在 bar dec5m[k] 上算 alpha(ts 历史
 # ≤ dec5m[k])"严格同因果,只是分辨率由 5m 变 1h。
 #
-# 逐字段规则:原始流量 sum、OHLC first/max/min/last、其余(CLOSE + 全部派生/比率/快照/微结构
-# 特征)右沿采样(= 决策 bar 的值)→ 保留 5min/1m 算出的派生特征值(vpin/kyle/rv/vol_zscore/…)。
-from evaluation.grammar import OperandToken as _OT
-
-_AGG_SUM   = frozenset({_OT.VOLUME, _OT.QUOTE_VOLUME, _OT.NUMBER_OF_TRADES, _OT.TAKER_BUY_QUOTE})
-_AGG_FIRST = frozenset({_OT.OPEN})
-_AGG_MAX   = frozenset({_OT.HIGH})
-_AGG_MIN   = frozenset({_OT.LOW})
-# 其余(CLOSE + 全部派生)→ 右沿采样(last),保留 5min-派生值
+# 逐字段规则:open=首、high=max、low=min、**量列(VOLUME kind,自动识别)= 区间累加 sum**、
+# 其余(close + 全部派生/比率/快照/微结构特征)右沿采样(= 决策 bar 的值)→ 保留 5min/1m 派生值。
+# 量列不再手写名单 —— 经 classify_kind 按列名自动判(volume/quote_volume/number_of_trades/
+# taker_buy_*_volume… 皆归 VOLUME → sum);任何市场的量列自动正确聚合。
+from markets.vocabulary import OperandKind, classify_kind
 
 
 def aggregate_5m_to_1h(panels_5m: dict) -> dict:
@@ -360,10 +356,10 @@ def aggregate_5m_to_1h(panels_5m: dict) -> dict:
         pad = np.full((11, S), np.nan, dtype=arr.dtype)
         a = np.concatenate([pad, arr], axis=0)[:12 * n]           # row k = a[12k:12k+12] = bars [12k−11, 12k]
         blk = a.reshape(n, 12, S)                                 # (n,12,S);blk[:,-1] = 右沿 = bar 12k
-        if   tok in _AGG_SUM:   r = blk.sum(axis=1)
-        elif tok in _AGG_MAX:   r = blk.max(axis=1)
-        elif tok in _AGG_MIN:   r = blk.min(axis=1)
-        elif tok in _AGG_FIRST: r = blk[:, 0]
-        else:                   r = blk[:, -1]                    # CLOSE + 派生:右沿采样
+        if   tok == 'open':                              r = blk[:, 0]
+        elif tok == 'high':                              r = blk.max(axis=1)
+        elif tok == 'low':                               r = blk.min(axis=1)
+        elif classify_kind(tok) is OperandKind.VOLUME:   r = blk.sum(axis=1)   # 量列自动识别 → 累加
+        else:                                            r = blk[:, -1]        # close + 派生:右沿采样
         out[tok] = np.ascontiguousarray(r, dtype=arr.dtype)
     return out
