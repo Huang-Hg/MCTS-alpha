@@ -28,7 +28,7 @@ import numpy as np
 from config.config import ini
 from backtest import ops
 from evaluation.ast import AlphaTree
-from markets import CALENDAR as _CAL
+from markets.profile import CALENDAR as _CAL
 
 
 # ============================================================================

@@ -16,7 +16,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from backtest import ops
-from evaluation.grammar import OperandToken
 
 
 # ============================================================================
@@ -38,7 +37,8 @@ from evaluation.grammar import OperandToken
 def signal_to_weight(alpha: np.ndarray,
                      leverage_cap: float = 1.0,
                      per_sym_cap: float | None = None,
-                     valid_mask: np.ndarray | None = None) -> np.ndarray:
+                     valid_mask: np.ndarray | None = None,
+                     market_neutral: bool = True) -> np.ndarray:
     """alpha (T, S) → weight (T, S) 或 alpha (S,) → weight (S,)。
 
     NaN sym → weight=0(不参与 mu/sd/L1);全行无效(n<2 或 sd≈0) → 整行 0。
@@ -63,8 +63,10 @@ def signal_to_weight(alpha: np.ndarray,
     # Step 2: clip(±3) — NaN 在 np.clip 下保持 NaN
     z = np.clip(z, -3.0, 3.0)
 
-    # Step 3: post-clip demean(C kernel,NaN-preserving)
-    z = ops.cs_demean(z)
+    # Step 3: post-clip demean(market-neutral / dollar-neutral Σw=0;C kernel,NaN-preserving)。
+    # market_neutral=False(统一 [neutralize] 不含 market)→ 跳过,允许净敞口;默认 True = bt C kernel 一致。
+    if market_neutral:
+        z = ops.cs_demean(z)
 
     # Step 4: NaN → 0 用于 L1 norm
     w = np.where(np.isfinite(z), z, 0.0)
@@ -232,8 +234,8 @@ def beta_neutralize(signal_dec: np.ndarray, close_dec: np.ndarray,
 # ============================================================================
 
 # 拥挤子空间 = README §4b 实证的 funding-成本流 co-exposure 轴(LSR + 基差/funding + OI)
-_CROWD_TOKENS = (OperandToken.FUNDING_RATE_INTERP, OperandToken.PREMIUM_INDEX_5M,
-                 OperandToken.SUM_TOP_LSR, OperandToken.SUM_OI_VALUE)
+_CROWD_TOKENS = ('funding_rate_interp', 'premium_index_5m',
+                 'sum_top_lsr', 'sum_oi_value')
 
 
 def build_crowding_basis(panels) -> np.ndarray:

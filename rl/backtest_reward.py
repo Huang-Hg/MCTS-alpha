@@ -17,7 +17,7 @@ import numpy as np
 
 from backtest import _bt as _bt_kernel
 from config.config import ini
-from markets import ACTIVE as _MKT, CALENDAR as _CAL
+from markets.profile import ACTIVE as _MKT, CALENDAR as _CAL, get_profile
 
 
 @dataclass
@@ -48,6 +48,127 @@ class BacktestRewardConfig:
         if not pairs:
             return None
         return np.array([x for pr in pairs for x in pr], dtype=np.float64)
+
+
+_EQUITY_PROFILE = 'us_equity_daily'
+
+
+@dataclass
+class EquityCostsConfig:
+    """US 权益回测口径(EquityPolicy:佣金+半点差单边对称 cost_rate、空腿日借券费;
+    无 funding / 强平 / sqrt-impact)。MTM 与 rebalance 全走**复权 OHLC**(单一总收益口径,
+    与 EquityPanel.fwd_ret 一致;不混原始价以免 split/分红跳空双计数)。年化走 us_equity_daily=252。"""
+    initial_cash:      float = 100_000.0
+    cost_rate:         float = ini('equity_costs', 'cost_rate',    0.0005)   # 佣金+半点差,单边 fraction
+    daily_borrow:      float = ini('equity_costs', 'daily_borrow', 0.0)      # 空腿日借券费(年化/252);0=关
+
+    @property
+    def skip_warmup_bars(self) -> int:
+        return get_profile(_EQUITY_PROFILE).warmup_bars
+
+    @property
+    def bars_per_year(self) -> float:
+        return get_profile(_EQUITY_PROFILE).calendar.bars_per_year
+
+
+def run_equity_bt(weights_TS: np.ndarray,
+                  adj_close_TS: np.ndarray, adj_open_TS: np.ndarray,
+                  ecfg: EquityCostsConfig,
+                  raw_weights: bool = True,
+                  with_equity: bool = False) -> Dict[str, float]:
+    """US 权益组合回测(EquityPolicy)→ 字典 (total_return / sharpe / mean_turnover [/ equity])。
+    weights_TS:(T,S) 最终目标权重(market-neutral long-short,Σw≈0;raw_weights=True 直接用)。
+    adj_close/adj_open:(T,S) **复权** OHLC(总收益口径)——MTM 用 adj_close,rebalance @ adj_open。
+    成本 = cost_rate×|Δnotional|(买卖对称);空腿借券 = daily_borrow×|notional|;无 funding/强平。
+    Sharpe 年化 = √bars_per_year(日线 US = √252)。"""
+    res = _bt_kernel.portfolio_bt_equity(
+        np.ascontiguousarray(weights_TS, dtype=np.float64),
+        np.ascontiguousarray(adj_close_TS, dtype=np.float64),
+        np.ascontiguousarray(adj_open_TS, dtype=np.float64),
+        ecfg.initial_cash, int(ecfg.skip_warmup_bars),
+        ecfg.cost_rate, ecfg.daily_borrow,
+        1 if raw_weights else 0,
+        0.0, None,                         # equity 暂不启用 per-name trailing-stop
+        float(ecfg.bars_per_year),
+    )
+    out = {
+        'total_return':  float(res['total_return']),
+        'sharpe':        float(res['sharpe']),
+        'mean_turnover': float(res['mean_turnover']),
+    }
+    if with_equity:
+        out['equity'] = np.asarray(res['equity'], dtype=np.float64)
+    return out
+
+
+_ASHARE_PROFILE = 'a_share_daily'
+
+
+@dataclass
+class AShareCostsConfig:
+    """中国 A 股回测口径(ASharePolicy:佣金双边 + 印花税卖出单边 + 过户费双边;**long-only**,无 funding/
+    强平/impact)。MTM/rebalance 全走 qfq 复权 OHLC(总收益)。年化 √242;daily cadence 天然满足 T+1。"""
+    initial_cash:      float = 100_000.0
+    commission:        float = ini('ashare_costs', 'commission',       0.00025)  # 佣金单边(万2.5)
+    stamp_tax_sell:    float = ini('ashare_costs', 'stamp_tax_sell',   0.0005)   # 印花税卖出单边(万5,2023 减半)
+    transfer_fee:      float = ini('ashare_costs', 'transfer_fee',     0.00001)  # 过户费双边(万0.1)
+    price_limit_pct:   float = ini('ashare_costs', 'price_limit_pct',  0.10)     # 涨跌停幅度(沪深300 主板 ±10%)
+
+    @property
+    def skip_warmup_bars(self) -> int:
+        return get_profile(_ASHARE_PROFILE).warmup_bars
+
+    @property
+    def bars_per_year(self) -> float:
+        return get_profile(_ASHARE_PROFILE).calendar.bars_per_year
+
+
+def ashare_trade_block(adj_close_TS: np.ndarray, adj_open_TS: np.ndarray,
+                       raw_volume_TS: np.ndarray, price_limit_pct: float) -> np.ndarray:
+    """涨跌停 / 停牌方向冻结掩码 (T,S) int8 —— 喂 run_ashare_bt 的 C 引擎(因果,只用 ≤t 信息)。
+    位语义:bit0(=1)开盘即涨停→禁买、bit1(=2)开盘即跌停→禁卖、3(=1|2)停牌→双禁。
+    判据(open-fill 口径):ratio=adj_open[t]/adj_close[t-1](复权抹除除权跳空 → 真涨跌幅);
+      涨停 ratio≥1+pct−1e-3、跌停 ratio≤1−pct+1e-3(1e-3 容 0.01 元 tick 取整误差);
+      停牌 = open 非有限 ∨ 当日 raw 成交量≤0。**用原始(含 NaN)面板**派生,非 ffill 后的。"""
+    T, S = adj_close_TS.shape
+    block = np.zeros((T, S), dtype=np.int8)
+    ratio = np.full((T, S), np.nan)
+    ratio[1:] = adj_open_TS[1:] / adj_close_TS[:-1]
+    block[ratio >= (1.0 + price_limit_pct) - 1e-3] |= 1           # 开盘涨停 → 禁买
+    block[ratio <= (1.0 - price_limit_pct) + 1e-3] |= 2           # 开盘跌停 → 禁卖
+    susp = ~np.isfinite(adj_open_TS) | ~np.isfinite(raw_volume_TS) | (raw_volume_TS <= 0.0)
+    block[susp] |= 3                                              # 停牌 → 双禁
+    return np.ascontiguousarray(block)
+
+
+def run_ashare_bt(weights_TS: np.ndarray,
+                  adj_close_TS: np.ndarray, adj_open_TS: np.ndarray,
+                  acfg: AShareCostsConfig,
+                  raw_weights: bool = True,
+                  trade_block: np.ndarray | None = None,
+                  with_equity: bool = False) -> Dict[str, float]:
+    """中国 A 股组合回测(ASharePolicy)→ 字典 (total_return / sharpe / mean_turnover [/ equity])。
+    weights_TS:(T,S) 最终目标权重(**long-only**,w≥0;A 股不可做空)。adj_*:qfq 复权 OHLC。
+    成本 = 佣金×|Δ|(双边)+ **印花税×卖出 notional(单边)** + 过户费×|Δ|;无 funding/强平。Sharpe √242。
+    trade_block((T,S) int8,可选):涨跌停 / 停牌方向冻结掩码(见 ashare_trade_block);受限方向不成交。"""
+    res = _bt_kernel.portfolio_bt_ashare(
+        np.ascontiguousarray(weights_TS, dtype=np.float64),
+        np.ascontiguousarray(adj_close_TS, dtype=np.float64),
+        np.ascontiguousarray(adj_open_TS, dtype=np.float64),
+        acfg.initial_cash, int(acfg.skip_warmup_bars),
+        acfg.commission, acfg.stamp_tax_sell, acfg.transfer_fee,
+        1 if raw_weights else 0,
+        None if trade_block is None else np.ascontiguousarray(trade_block, dtype=np.int8),
+        float(acfg.bars_per_year),
+    )
+    out = {
+        'total_return':  float(res['total_return']),
+        'sharpe':        float(res['sharpe']),
+        'mean_turnover': float(res['mean_turnover']),
+    }
+    if with_equity:
+        out['equity'] = np.asarray(res['equity'], dtype=np.float64)
+    return out
 
 
 def _ffill_panel(panel: np.ndarray) -> np.ndarray:

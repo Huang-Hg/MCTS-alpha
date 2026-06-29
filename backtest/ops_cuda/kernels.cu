@@ -288,6 +288,92 @@ __device__ void cs_rank_core(const T* __restrict__ x, T* __restrict__ out, int S
 
 
 /* ============================================================================
+ * metrics 融合核:逐 t 一 block,warp-shuffle 单遍归约 → (T,) f64
+ *   (替 metrics.py 的多遍整盘 .sum(1):per_t_ic ~10 遍 / per_t_pnl ~7 遍 → 1 核单遍)。
+ *   累加器恒 double(对齐 metrics.py _F64,消费卡 f32 panel 仍保全盘 reduction 精度)。
+ *   块 256 线程(8 warp);S 列 grid-stride 累入线程私有,warp_reduce + shared 跨 warp 归约。
+ * ========================================================================== */
+
+/* per_t_ic:逐 t Pearson IC。n<3 或 dx<=0 或 dy<=0 → NaN(贴 fm_per_t_ic / metrics.per_t_ic)。 */
+template<typename T>
+__device__ void per_t_ic_core(const T* __restrict__ x, const T* __restrict__ y,
+                              double* __restrict__ out, int S) {
+    int t = blockIdx.x;
+    const T* xr = x + (long long)t * S;
+    const T* yr = y + (long long)t * S;
+    int tid = threadIdx.x, B = blockDim.x, lane = tid & 31, wid = tid >> 5, nwarp = B >> 5;
+    double n = 0, sx = 0, sy = 0, sxy = 0, sxx = 0, syy = 0;
+    for (int s = tid; s < S; s += B) {
+        double vx = (double)xr[s], vy = (double)yr[s];
+        if (isfinite(vx) && isfinite(vy)) { n += 1; sx += vx; sy += vy; sxy += vx * vy; sxx += vx * vx; syy += vy * vy; }
+    }
+    n = warp_reduce_sum<double>(n); sx = warp_reduce_sum<double>(sx); sy = warp_reduce_sum<double>(sy);
+    sxy = warp_reduce_sum<double>(sxy); sxx = warp_reduce_sum<double>(sxx); syy = warp_reduce_sum<double>(syy);
+    __shared__ double wn[32], wsx[32], wsy[32], wsxy[32], wsxx[32], wsyy[32];
+    if (lane == 0) { wn[wid] = n; wsx[wid] = sx; wsy[wid] = sy; wsxy[wid] = sxy; wsxx[wid] = sxx; wsyy[wid] = syy; }
+    __syncthreads();
+    if (wid == 0) {
+        n = (lane < nwarp) ? wn[lane] : 0.0; sx = (lane < nwarp) ? wsx[lane] : 0.0; sy = (lane < nwarp) ? wsy[lane] : 0.0;
+        sxy = (lane < nwarp) ? wsxy[lane] : 0.0; sxx = (lane < nwarp) ? wsxx[lane] : 0.0; syy = (lane < nwarp) ? wsyy[lane] : 0.0;
+        n = warp_reduce_sum<double>(n); sx = warp_reduce_sum<double>(sx); sy = warp_reduce_sum<double>(sy);
+        sxy = warp_reduce_sum<double>(sxy); sxx = warp_reduce_sum<double>(sxx); syy = warp_reduce_sum<double>(syy);
+        if (lane == 0) {
+            double r;
+            if (n < 3.0) r = nan("");
+            else {
+                double mx = sx / n, my = sy / n;
+                double num = sxy - mx * sy, dx = sxx - mx * sx, dy = syy - my * sy;
+                r = (dx > 0.0 && dy > 0.0) ? num / sqrt(dx * dy) : nan("");
+            }
+            out[t] = r;
+        }
+    }
+}
+
+/* per_t_pnl:v=values−cs_mean(finite),w=v/Σ|v|,out=Σ w·y(v&y finite);n_v==0 或 Σ|v|<1e-12 → 0。
+ * 两轮归约(先 cs_mean 全块广播,再 Σ|v| 与 Σ v·y),贴 fm_per_t_pnl / metrics.per_t_pnl。 */
+template<typename T>
+__device__ void per_t_pnl_core(const T* __restrict__ vals, const T* __restrict__ y,
+                               double* __restrict__ out, int S) {
+    int t = blockIdx.x;
+    const T* vr = vals + (long long)t * S;
+    const T* yr = y + (long long)t * S;
+    int tid = threadIdx.x, B = blockDim.x, lane = tid & 31, wid = tid >> 5, nwarp = B >> 5;
+    double sv = 0, nv = 0;
+    for (int s = tid; s < S; s += B) { double v = (double)vr[s]; if (isfinite(v)) { sv += v; nv += 1; } }
+    sv = warp_reduce_sum<double>(sv); nv = warp_reduce_sum<double>(nv);
+    __shared__ double wsv[32], wnv[32], mean_sh; __shared__ int ok_sh;
+    if (lane == 0) { wsv[wid] = sv; wnv[wid] = nv; }
+    __syncthreads();
+    if (wid == 0) {
+        double s2 = (lane < nwarp) ? wsv[lane] : 0.0, n2 = (lane < nwarp) ? wnv[lane] : 0.0;
+        s2 = warp_reduce_sum<double>(s2); n2 = warp_reduce_sum<double>(n2);
+        if (lane == 0) { if (n2 < 1.0) { ok_sh = 0; } else { ok_sh = 1; mean_sh = s2 / n2; } }
+    }
+    __syncthreads();
+    if (!ok_sh) { if (tid == 0) out[t] = 0.0; return; }
+    double mean = mean_sh, sab = 0, pnl = 0;
+    for (int s = tid; s < S; s += B) {
+        double v = (double)vr[s];
+        if (isfinite(v)) {
+            double dv = v - mean; sab += fabs(dv);
+            double yv = (double)yr[s];
+            if (isfinite(yv)) pnl += dv * yv;
+        }
+    }
+    sab = warp_reduce_sum<double>(sab); pnl = warp_reduce_sum<double>(pnl);
+    __shared__ double wsab[32], wpnl[32];
+    if (lane == 0) { wsab[wid] = sab; wpnl[wid] = pnl; }
+    __syncthreads();
+    if (wid == 0) {
+        double a = (lane < nwarp) ? wsab[lane] : 0.0, p = (lane < nwarp) ? wpnl[lane] : 0.0;
+        a = warp_reduce_sum<double>(a); p = warp_reduce_sum<double>(p);
+        if (lane == 0) out[t] = (a < 1e-12) ? 0.0 : (p / a);
+    }
+}
+
+
+/* ============================================================================
  * extern "C" f64/f32 实例化(cupy 按平名 get_function)
  * ========================================================================== */
 #define INST_TS(name, core) \
@@ -313,3 +399,8 @@ extern "C" __global__ void k_cs_f32(const float*  x, float*  o, int S, int op) {
 
 extern "C" __global__ void k_cs_rank_f64(const double* x, double* o, int S) { cs_rank_core<double>(x, o, S); }
 extern "C" __global__ void k_cs_rank_f32(const float*  x, float*  o, int S) { cs_rank_core<float >(x, o, S); }
+
+extern "C" __global__ void k_per_t_ic_f64(const double* x, const double* y, double* o, int S) { per_t_ic_core<double>(x, y, o, S); }
+extern "C" __global__ void k_per_t_ic_f32(const float*  x, const float*  y, double* o, int S) { per_t_ic_core<float >(x, y, o, S); }
+extern "C" __global__ void k_per_t_pnl_f64(const double* v, const double* y, double* o, int S) { per_t_pnl_core<double>(v, y, o, S); }
+extern "C" __global__ void k_per_t_pnl_f32(const float*  v, const float*  y, double* o, int S) { per_t_pnl_core<float >(v, y, o, S); }

@@ -13,6 +13,6 @@ echo "[1/2] NVRTC 编译 kernels.cu(import backtest.ops_cuda → 编 f64/f32 全
 cd "$ROOT"
 "$PY" -c "import backtest.ops_cuda as g; print('  OK dtype=%s FP64:FP32=1:%d optin=%dKB' % (__import__('numpy').dtype(g.DTYPE).name, g._FP64_RATIO, g._OPTIN//1024))"
 
-echo "[2/2] 逐算子 vs 真 C 验证(需 tmp/ops_build/_ops,缺则先 bash scripts/build_ops_so.sh)..."
-"$PY" scripts/smoke_ops_cuda.py | tail -3
+echo "[2/2] GPU 算子/融合核 vs numpy 黄金参考差分验证(NaN 位逐位 + finite 容差,融合核回归门)..."
+"$PY" -X utf8 -m scripts.verify_fused
 echo "Done."
