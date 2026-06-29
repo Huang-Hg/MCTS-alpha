@@ -9,8 +9,7 @@
     python main.py alphasage     OUTPUT_JSON      # AlphaSAGE GFlowNet 因子挖掘 + alpha pool
     python main.py materialize   INPUT_JSON   OUTPUT_DIR
 
-实盘(binance-trader 跑)走独立入口 `python -m trade`,见 trade/__main__.py。
-sizing 已是确定性(AFF 融合 + topk + vol-target,见 trade/signal.py);旧 RL three-head policy 已删(2026-06-27)。
+sizing 已是确定性(AFF 融合 + topk + vol-target);旧 RL three-head policy 已删(2026-06-27)。
 
 gp-baseline / alphasage = 搜索 + net 感知准入建池(AFF 因果滚动融合);评估全复用 evaluator/alpha_pool。
 """
@@ -175,7 +174,7 @@ def cmd_gp_baseline(output: str) -> None:
                             'val_pool_ret': pool_ret, 'collected': len(collected)},
                            ensure_ascii=False) + '\n')
     with open(output, 'w', encoding='utf-8') as f:
-        json.dump({'pool': pool.to_jsonable()}, f, ensure_ascii=False, indent=2)   # {'pool':[...]} = live/materialize 同契约
+        json.dump({'pool': pool.to_jsonable()}, f, ensure_ascii=False, indent=2)   # {'pool':[...]} = 部署/materialize 同契约
     log(f"[gp-baseline] deploy bundle → {output};snapshot → {snap}")
 
     # 跨 run 正交 alpha 库:本轮 collected 内存 pnl 贪心挑 within-run 正交高 IC append(只存因子)
@@ -291,7 +290,7 @@ def cmd_alphasage(output: str) -> None:
         f.write(json.dumps({'pool': pool.to_jsonable(), 'val_pool_ic': pool_ic,
                             'val_pool_ret': pool_ret}, ensure_ascii=False) + '\n')
     with open(output, 'w', encoding='utf-8') as f:
-        json.dump({'pool': pool.to_jsonable()}, f, ensure_ascii=False, indent=2)   # {'pool':[...]} = live/materialize 同契约
+        json.dump({'pool': pool.to_jsonable()}, f, ensure_ascii=False, indent=2)   # {'pool':[...]} = 部署/materialize 同契约
     log(f"[alphasage] deploy bundle → {output};snapshot → {snap}")
 
 

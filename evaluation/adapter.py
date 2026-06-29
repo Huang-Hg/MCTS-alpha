@@ -70,7 +70,7 @@ class PanelBundle:
     highs:        np.ndarray                  # (T, S) float64 — bar high,L3 maker intra-bar fill 判定
     lows:         np.ndarray                  # (T, S) float64 — bar low,同上
     member_mask:  np.ndarray = None           # (T, S) bool — 因果 universe 可持仓资格
-                                              # (trailing qv-window hourly top-N + grace,live rotation 复刻);
+                                              # (trailing qv-window hourly top-N + grace,部署期 rotation 复刻);
                                               # 持仓 valid = listed(qvol>0) ∧ member。行数据 ≠ 资格:
                                               # 行只供特征/ts 历史,可交易性由本 mask 把关。
 
@@ -153,18 +153,18 @@ def load_panel(
     keep_lo = pd.Timestamp(pre_start + '-01', tz='UTC')
     keep_hi = max(train_hi, val_hi) if val_hi is not None else train_hi
 
-    # ---------- Pass 1:因果 universe(trailing qv-window hourly top-N + grace,live rotation 复刻) ----------
-    # universe 是一等因果 artifact(evaluation/universe.py,与 live 同语义内核:
-    # live fetch_quote_volume_ranks 同为 1h kline 滚 qv_window_hours 和,精确对齐非近似):
+    # ---------- Pass 1:因果 universe(trailing qv-window hourly top-N + grace,部署期 rotation 复刻) ----------
+    # universe 是一等因果 artifact(evaluation/universe.py,部署期同语义内核:
+    # 部署期 quote-volume rank 同为 1h kline 滚 qv_window_hours 和,精确对齐非近似):
     #   - membership = 从 parquet 自身 qvol 派生的**因果 trailing top-N**。行存在性
     #     = 历史候选集:候选缺失只致边缘 rank 噪声,不授予未来信息 membership。
     #   - 列并集 = 加载窗内 ever-holdable(列存在 ≠ 资格;逐 bar 资格由 member_mask 把关)。
     # 28 个 operand panel(10 f64 + 18 f32)× T_full × S 常驻内存;全史 ever-member ~669,
     # S=669 峰值 ≈ 46.8 GB(110 GB 容器富余)。全保留 ever-holdable,不按未来在场度砍名
     # (按未来 holdable-hours 砍尾 = universe-selection lookahead)。
-    univ_top_n   = int(ini('trade_universe', 'top_n', 30))
-    univ_persist = int(ini('trade_universe', 'hold_max_persist', 4))
-    univ_qvw     = int(ini('trade_universe', 'qv_window_hours', 4))   # 与 live rotation 同窗(单一参数源)
+    univ_top_n   = 30
+    univ_persist = 8
+    univ_qvw     = 8    # 流动性窗:trailing Σ quoteVol 的小时数(1h kline 聚合)
 
     def _qv_one(mo: str):
         p = root / f'{mo}.parquet'
@@ -328,8 +328,8 @@ def load_panel(
 
     # ---------- metrics 因果对齐:发布延迟统一 lag-1 ----------
     # /futures/data/* bin T 实际发布于 T+0.8–3.1min(takerlongshortRatio 6.4–8.4min),
-    # vision zip 落终值 → 不 shift 即默认偷看未来发布。live 端 panel lag-1 merge 后,
-    # 此处同构 shift 使训练/回测与 live 决策因果严格一致(全列统一 lag-1,不为 taker 开特例)。
+    # vision zip 落终值 → 不 shift 即默认偷看未来发布。部署端 panel lag-1 merge 后,
+    # 此处同构 shift 使训练/回测与部署决策因果严格一致(全列统一 lag-1,不为 taker 开特例)。
     # 派生列(oi_log_ret/oi_chg_N)对全局 shift 与"先 shift raw 再重算"严格交换,直接 shift。
     for c in ('sum_oi', 'sum_oi_value',
               'oi_log_ret', 'oi_chg_48', 'oi_chg_288',

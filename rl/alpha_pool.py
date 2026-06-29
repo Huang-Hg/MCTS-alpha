@@ -8,7 +8,7 @@ admission / 留池:质量幅度 q = 候选 **|rank IC|**(标准秩 IC 幅值)。
     ③ OOS holdout:末 holdout_frac 段 fit 方向不盈利 → 拒。
   每次 admit 后 leave-one-out 重算 prune:冗余簇(R²_loo>r2_cap)非空 → 踢簇内 |rank_ic| 最小者
   (留最强代表);否则超容量 / Δ_loo<floor → 踢 argmin Δ_loo(= q·(1−R²_loo))
-  → 更强候选挤掉弱钉子户,连续自清洁。池**不定权**(deploy/eval/live 全走 AFF 因果滚动融合,见 rl.sizing.aff_fuse)。
+  → 更强候选挤掉弱钉子户,连续自清洁。池**不定权**(deploy/eval 全走 AFF 因果滚动融合,见 rl.sizing.aff_fuse)。
 
 per_t_pnl(evaluator 里 ops.per_t_pnl 算):v = values − cs_mean;w = v/Σ|v|;per_t_pnl[t] = Σ_s w[t,s]·y[t,s]
   (cs-demean + L1=1 normalize;仅供 R² 正交度量 + OOS holdout,质量幅度走 |rank IC|)。
@@ -57,13 +57,13 @@ class LinearAlphaPool:
     # OOS holdout 边际门:末 holdout_frac 比例 per_t_pnl bars 作嵌入式 holdout,候选用 fit 段估的
     # 部署方向必须在 holdout 段真盈利才入池(挡正交+有 |IC| 但 OOS 退化的过度生长)。
     holdout_frac:      float = ini('alpha_pool', 'holdout_frac',      0.25)
-    # live panel 物理深度(= trade_panel.cold_load_days × hours_per_day,1h bars):required_depth
-    # 超此的树上线后每次决策整树 NaN→哑火,结构性硬拒。hours_per_day 由 active MarketProfile 派生(crypto 24)。
-    max_panel_depth:   int   = ini('trade_panel', 'cold_load_days', 21) * int(_CAL.hours_per_day)
+    # panel 物理深度(= 21 日 × hours_per_day,1h bars):required_depth 超此的树每次决策整树
+    # NaN→哑火,结构性硬拒。hours_per_day 由 active MarketProfile 派生(crypto 24)。
+    max_panel_depth:   int   = 21 * int(_CAL.hours_per_day)
 
     members:  List[PoolMember] = field(default_factory=list)
     # 平行数组(与 members 同序)。single_q = 各成员 |rank IC|(admission/prune 质量幅度)。
-    # 池不再定权(deploy/eval/live 全走 AFF 因果滚动融合,见 rl.sizing.aff_fuse)。
+    # 池不再定权(deploy/eval 全走 AFF 因果滚动融合,见 rl.sizing.aff_fuse)。
     single_q:   np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
     # PnL Pearson 矩阵(对角 1,off-diagonal = pearson(per_t_pnl_i, per_t_pnl_j))
     pnl_corrs:  np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float64))
@@ -162,13 +162,13 @@ class LinearAlphaPool:
         cand_rank_ic = 候选带符号秩 IC(落 PoolMember.rank_ic / bundle,供质量幅度与参考);
         cand_quality = 质量幅度源(admission/prune 的 single_q = |cand_quality|;None → 回落 |rank_ic|。
           gross-aware 搜索传 |top-K gross Sharpe| → 池按 Sharpe 质量留/剔,治 IC↔PnL 背离)。
-        池不定权(deploy/eval/live 全走 AFF 融合)。"""
+        池不定权(deploy/eval 全走 AFF 融合)。"""
         q = abs(cand_quality) if cand_quality is not None else abs(cand_rank_ic)   # 质量幅度
         sig = cand_tree.hash
         if sig in self._failure_cache:
             return False, 0.0
-        # 深度硬门:嵌套窗+operand warmup 超 live panel 物理深度的树,离线 T 充裕评得动、
-        # live 上每次决策整树 NaN(深度死)→ 结构性拒,不进池。
+        # 深度硬门:嵌套窗+operand warmup 超部署 panel 物理深度的树,离线 T 充裕评得动、
+        # 部署时每次决策整树 NaN(深度死)→ 结构性拒,不进池。
         if cand_tree.required_depth() > self.max_panel_depth:
             self._failure_cache.add(sig)
             return False, 0.0

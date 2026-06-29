@@ -212,9 +212,9 @@ SCHEMA_COLUMNS = [
 
 
 # ---------------------------------------------------------------------------
-# 4b) premium / funding 派生(P0 enrich 列;offline enrich + live LivePanel 共享数学源)
+# 4b) premium / funding 派生(P0 enrich 列;offline enrich 与部署期 panel 共享数学源)
 #     parquet_5m 默认不含这 3 列(SCHEMA_COLUMNS 之外),由 enrich_5m_panel in-place 加;
-#     live 由 LivePanel 用同一对函数算 → train==live。2026-05-24 bit-exact 复刻验证通过。
+#     部署期用同一对函数算 → train==部署。2026-05-24 bit-exact 复刻验证通过。
 # ---------------------------------------------------------------------------
 
 PREMIUM_FUNDING_COLUMNS = ['premium_index_5m', 'funding_rate_interp', 'funding_countdown_norm']
@@ -320,7 +320,7 @@ def build_5m_for_month(
 
 
 # ---------------------------------------------------------------------------
-# 5) dense (T,S) 5m → 1h operand-panel 下采样(alpha-eval 提速;train adapter + live panel 共享)
+# 5) dense (T,S) 5m → 1h operand-panel 下采样(alpha-eval 提速;train adapter 与部署期 panel 共享)
 # ---------------------------------------------------------------------------
 # 动机:alpha 决策本就 1h cadence(gate_dec 步长 12),公式在全 5m 面板上求值是唯一仍在 5m 的热
 # 路径(eval_tree ~82% 由 ts/pair 滚动窗口主导)。把 alpha 算子读的 operand 面板降到 1h →

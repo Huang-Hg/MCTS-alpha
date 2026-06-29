@@ -408,7 +408,7 @@ def _eval_block(
 #   - 整树自底向上递归,中间结果全 (T,S) 常驻 cupy(显存富余:实测 1.78GB/32GB)。
 #   - 算子全走 backtest.ops_cuda(语义对齐真 C,容差 ~1e-6;dtype=消费卡 f32/数据中心 f64)。
 #   - 链根 D2H 回 numpy f64 → evaluator 下游零改;cache 入参兼容但 GPU 路不用(整树常驻够快)。
-# **cupy / ops_cuda / GPU 分发表全部 lazy**:device=cpu 进程(含 live 无 cupy)import 本模块零触
+# **cupy / ops_cuda / GPU 分发表全部 lazy**:device=cpu 进程(无 cupy)import 本模块零触
 # cupy;首次 cuda 求值时 _gpu_init() 构建一次。GPU/CPU FP 累加序不同 → 非 bitwise,两路各自自洽。
 _GPU = None                                   # lazy GPU state(cupy/ops_cuda/分发表)
 _GPANEL_CACHE: Dict[int, tuple] = {}          # id(panels) → (sentinel, {tok: cupy})

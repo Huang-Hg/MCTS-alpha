@@ -33,13 +33,13 @@ class BacktestRewardConfig:
     skip_warmup_bars:  int   = _MKT.warmup_bars        # crypto 288;由 active MarketProfile 派生
     leverage_cap:      float = ini('backtest_reward', 'leverage_cap',      2.0)    # top-K 多空 gross 目标 Σ|w|
     max_concentration: float = ini('backtest_reward', 'max_concentration', 0.20)   # 旧 z 加权 clip;top-K 下不触及
-    # top-K 多空组合构造(eval≡live 共享口径;贴 alphasage/alphacfg top-K 等权 + 允许做空 + swap 缓冲)
+    # top-K 多空组合构造(eval/部署共享口径;贴 alphasage/alphacfg top-K 等权 + 允许做空 + swap 缓冲)
     top_k:             int   = ini('backtest_reward', 'top_k',    8)               # 每腿仓数(多 top_k + 空 bottom_k)
     swap_n:            int   = ini('backtest_reward', 'swap_n',   2)               # 每腿每 rebalance 最多换出名数
     min_hold:          int   = ini('backtest_reward', 'min_hold', 4)               # 在持满 N 决策 bar 才可换出
-    # per-name trailing stop + latch:与 live 同源读 [trade_execute](bt 环境 = 部署环境);0 = 关闭。
-    stop_trail_pct:    float = ini('trade_execute', 'stop_trail_pct', 0.0)
-    stop_ratchet:      str   = ini('trade_execute', 'stop_ratchet',   '')
+    # per-name trailing stop + latch(crypto 永续回测);0 = 关闭。
+    stop_trail_pct:    float = 0.22
+    stop_ratchet:      str   = '0.5:0.12,1.0:0.08'
 
     def stop_ratchet_flat(self) -> np.ndarray | None:
         """'0.5:0.12,1.0:0.08' → flat (2k,) 升序 [gain, trail, ...];'' → None。"""

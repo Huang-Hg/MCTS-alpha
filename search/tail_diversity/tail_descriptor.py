@@ -18,7 +18,7 @@
     SVD 廉价版供搜索内循环每候选用。
 
 no-lookahead 说明:tail_mask 的 market_loss 指标在**评估窗内 post-hoc** 算(与 IC 同源,
-    研究期度量,不做前向交易决策)。若挪到 live 因果门,指标须改为滚动因果版。见 [[feedback_no_lookahead]]。
+    研究期度量,不做前向交易决策)。若挪到部署因果门,指标须改为滚动因果版。见 [[feedback_no_lookahead]]。
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""确定性 sizing / 信号变换层 — 均与 bt eval / live 共享、无 policy 反馈环(2026-06-27 删 RL 孪生):
+"""确定性 sizing / 信号变换层 — 均与 bt eval 共享、无 policy 反馈环(2026-06-27 删 RL 孪生):
 
 1. **alpha → weight 转换**(`signal_to_weight`):cs_zscore → clip(±3) → post-clip demean
    (dollar-neutral)→ L1 normalize with cap,与 bt C kernel `_row_signal_to_weight` 逐字一致。
@@ -23,9 +23,8 @@ from backtest import ops
 #
 # Canonical alpha → weight 转换,**与 bt C kernel `_row_signal_to_weight` 完全一致**。
 #
-# bt 内核(`backtest/portfolio_bt.c:49`)与 live(`trade/signal.py`)必须用同一份转换逻辑,
-# 否则 deploy bundle 在 bt 上 sharpe 与 live 行为不可比(已踩过坑:live 缺 post-clip
-# demean → 非 dollar-neutral,16h -11% 部分由此引发)。
+# 转换逻辑须与回测内核(`backtest/engine`)逐位一致,否则 deploy bundle 在 bt 上的
+# sharpe 不可复现(已踩过坑:缺 post-clip demean → 非 dollar-neutral)。
 #
 # 四步:
 #   1. cs_zscore(NaN-aware,只在 finite sym 上算 mu/sd)
@@ -76,7 +75,7 @@ def signal_to_weight(alpha: np.ndarray,
                      1.0)
     w = w * scale
 
-    # Step 5(H7,仅 live 用):per-sym cap → 重 demean → 收敛。clip+demean 是 contraction,
+    # Step 5(H7,仅部署用):per-sym cap → 重 demean → 收敛。clip+demean 是 contraction,
     # 3 轮足够收敛到 max|w| ≤ cap 且 Σw≈0(实测 24 sym basket,3 轮 max|w|-cap < 1e-12)。
     if per_sym_cap is not None and per_sym_cap > 0:
         for _ in range(3):
@@ -107,7 +106,7 @@ def signal_to_weight(alpha: np.ndarray,
 #   - 失去 valid(退市/掉出因果 universe)的在持名强制平,不受 min_hold 约束
 #
 # 有状态:跨决策 bar 维护多/空持仓集 + 每名持有时长。backtest 走 path(顺序循环),
-# live 单步复用同一 _step → 保证 eval≡live。
+# 部署单步复用同一 _step → 保证 eval/部署一致。
 # ============================================================================
 
 def _topk_ls_step(sig, valid, long_held, short_held, age, k, n_swap, min_hold):
@@ -308,9 +307,9 @@ def aff_fuse(mz: np.ndarray, y_dec: np.ndarray, valid: np.ndarray,
 #   - vol-target 价值主要在压尾部 MDD;趋势市里降 gross 反损收益,故 mult 是收益/MDD 前沿旋钮。
 #
 # scale_t = max(mult · target_vol / vol_24h_t, scale_min);target_vol 取 train 段 vol_24h 中位
-# ([trade_signal] target_vol;≤0 → 不缩放,满仓收益最优锚)。gross_backstop 只缩(ruin 栏)。
+# (≤0 → 不缩放,满仓收益最优锚)。gross_backstop 只缩(ruin 栏)。
 # 上限 clip(原 scale_max=4.0)2026-06-05 删:k=4 时 82% dec 被它钳死成伪常数;上栏职责
-# 归 gross_backstop([trade_signal] sizing_gross_cap,= 保证金可行线 0.9×account_leverage)。
+# 归 gross_backstop(sizing_gross_cap)。
 # ============================================================================
 
 @dataclass

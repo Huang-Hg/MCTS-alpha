@@ -1,5 +1,5 @@
 """
-Alpha 评估 — 标准 IC 口径(唯一质量 = rank IC;池不定权,deploy/eval/live 走 AFF 融合;2026-06-27 删 icir)。
+Alpha 评估 — 标准 IC 口径(唯一质量 = rank IC;池不定权,deploy/eval 走 AFF 融合;2026-06-27 删 icir)。
 
 门通路(任一门拒 → _bad;below-gate → per_t_pnl=None,gp 侧落 _REWARD_FLOOR 不收集):
   G0         无 operand / raw-price-wrapper(无 ts_*/pair 且仅 OHLCV leaf)结构静态拒

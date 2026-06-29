@@ -187,7 +187,7 @@ class AlphaTree:
     def required_depth(self) -> int:
         """最后一行非 warmup 所需最小 panel 行数:嵌套 ts/pair 沿路径累加 (w−1),
         operand 叶计自身派生窗(panel 构建端 rolling warmup + metrics lag-1)。
-        live panel 深度有限(cold_load_days×288),required_depth 超深度的树 live 上
+        部署 panel 深度有限(cold_load_days×288),required_depth 超深度的树部署时
         每次决策都整树 NaN→哑火 → 选池硬拒的依据。"""
         def walk(n: Node) -> int:
             if n.kind == 'operand':
