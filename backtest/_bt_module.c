@@ -5,7 +5,7 @@
  * 导出:
  *   portfolio_bt(alpha, close, open, high|None, low|None,
  *                bar_volume|None, sigma|None, funding|None,
- *                init_cash, skip_warmup, half_spread, fee, impact_Y, mmr, [...])
+ *                init_cash, skip_warmup, half_spread, fee, impact_Y, mmr, [..., bars_per_year])
  *       → dict(equity, turnover, cost_drag, liq_at,
  *              total_return, sharpe, mean_turnover)
  *   stop_latch_scan(w_dec, close_5m, start_idx, bars_per_dec, trail, ratchet|None)
@@ -47,19 +47,24 @@ static PyObject* py_portfolio_bt(PyObject* self, PyObject* args) {
     double max_concentration = 0.0; /* default 禁用 */
     int raw_weights = 0;            /* default 0;1 = 跳过 step 1,RL 路径用 */
     double stop_trail_pct = 0.0;    /* default 关闭 */
+    /* Sharpe 年化 bar 数(= 权益曲线采样 cadence 的年 bar 数)。
+     * default 365×24×12=105120 = 24/7 5m(逐位复现旧行为);US 日线注入 252、5m 注入 252×78。
+     * 由 markets.TradingCalendar.bars_per_year 提供。 */
+    double bars_per_year = 365.0 * 24.0 * 12.0;
 
-    /* O×8 d L d×4 | d d i O d O
+    /* O×8 d L d×4 | d d i O d O d
      *  alpha close open high low bvol sigma fund | cash skip | hs fee Y mmr |
      *  leverage_cap(opt) max_concentration(opt)
-     *  raw_weights(opt) leverage_TS(opt) stop_trail_pct(opt) stop_ratchet(opt) */
-    if (!PyArg_ParseTuple(args, "OOOOOOOOdLdddd|ddiOdO",
+     *  raw_weights(opt) leverage_TS(opt) stop_trail_pct(opt) stop_ratchet(opt) bars_per_year(opt) */
+    if (!PyArg_ParseTuple(args, "OOOOOOOOdLdddd|ddiOdOd",
                           &o_alpha, &o_close, &o_open,
                           &o_high, &o_low,
                           &o_bvol, &o_sigma, &o_funding,
                           &init_cash, &skip_warmup_ll,
                           &half_spread, &fee, &impact_Y, &mmr,
                           &leverage_cap, &max_concentration, &raw_weights,
-                          &o_leverage, &stop_trail_pct, &o_ratchet)) {
+                          &o_leverage, &stop_trail_pct, &o_ratchet,
+                          &bars_per_year)) {
         return NULL;
     }
 
@@ -178,7 +183,7 @@ static PyObject* py_portfolio_bt(PyObject* self, PyObject* args) {
         double mean = sum_lr / (double)n_r;
         double var  = (sum_lr_sq - mean * sum_lr) / (double)(n_r - 1);
         if (var > 0.0) {
-            sharpe = mean / sqrt(var) * sqrt(365.0 * 24.0 * 12.0);
+            sharpe = mean / sqrt(var) * sqrt(bars_per_year);
         }
     }
 
@@ -304,7 +309,7 @@ static PyMethodDef methods[] = {
      "portfolio_bt(alpha, close, open, high|None, low|None, "
      "bar_volume|None, sigma|None, funding|None, "
      "init_cash, skip_warmup, half_spread, fee, impact_Y, mmr, "
-     "[leverage_cap=1.0, max_concentration=0.0, raw_weights=0, leverage_TS=None, stop_trail_pct=0.0, stop_ratchet=None]) -> dict"},
+     "[leverage_cap=1.0, max_concentration=0.0, raw_weights=0, leverage_TS=None, stop_trail_pct=0.0, stop_ratchet=None, bars_per_year=105120.0]) -> dict"},
     {"stop_latch_scan", py_stop_latch_scan, METH_VARARGS,
      "stop_latch_scan(w_dec, close_5m, start_idx, bars_per_dec, trail, ratchet|None) -> (keep, jstar, fired)"},
     {NULL, NULL, 0, NULL}

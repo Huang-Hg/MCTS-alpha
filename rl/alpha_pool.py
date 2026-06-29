@@ -28,6 +28,7 @@ import numpy as np
 from config.config import ini
 from backtest import ops
 from evaluation.ast import AlphaTree
+from markets import CALENDAR as _CAL
 
 
 # ============================================================================
@@ -56,9 +57,9 @@ class LinearAlphaPool:
     # OOS holdout 边际门:末 holdout_frac 比例 per_t_pnl bars 作嵌入式 holdout,候选用 fit 段估的
     # 部署方向必须在 holdout 段真盈利才入池(挡正交+有 |IC| 但 OOS 退化的过度生长)。
     holdout_frac:      float = ini('alpha_pool', 'holdout_frac',      0.25)
-    # live panel 物理深度(= trade_panel.cold_load_days × 24,1h bars):required_depth 超此的树
-    # 上线后每次决策整树 NaN→哑火,结构性硬拒。
-    max_panel_depth:   int   = ini('trade_panel', 'cold_load_days', 21) * 24
+    # live panel 物理深度(= trade_panel.cold_load_days × hours_per_day,1h bars):required_depth
+    # 超此的树上线后每次决策整树 NaN→哑火,结构性硬拒。hours_per_day 由 active MarketProfile 派生(crypto 24)。
+    max_panel_depth:   int   = ini('trade_panel', 'cold_load_days', 21) * int(_CAL.hours_per_day)
 
     members:  List[PoolMember] = field(default_factory=list)
     # 平行数组(与 members 同序)。single_q = 各成员 |rank IC|(admission/prune 质量幅度)。

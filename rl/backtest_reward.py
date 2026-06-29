@@ -17,6 +17,7 @@ import numpy as np
 
 from backtest import _bt as _bt_kernel
 from config.config import ini
+from markets import ACTIVE as _MKT, CALENDAR as _CAL
 
 
 @dataclass
@@ -29,7 +30,7 @@ class BacktestRewardConfig:
     fee_rate:          float = ini('backtest_reward', 'fee_rate',          0.00050)
     impact_Y:          float = ini('backtest_reward', 'impact_Y',          0.5)
     maint_margin_rate: float = 0.005
-    skip_warmup_bars:  int   = 288
+    skip_warmup_bars:  int   = _MKT.warmup_bars        # crypto 288;由 active MarketProfile 派生
     leverage_cap:      float = ini('backtest_reward', 'leverage_cap',      2.0)    # top-K 多空 gross 目标 Σ|w|
     max_concentration: float = ini('backtest_reward', 'max_concentration', 0.20)   # 旧 z 加权 clip;top-K 下不触及
     # top-K 多空组合构造(eval≡live 共享口径;贴 alphasage/alphacfg top-K 等权 + 允许做空 + swap 缓冲)
@@ -137,6 +138,7 @@ def run_bt(deployed_signal: np.ndarray,
         None,                            # leverage_TS:isolated 杠杆未启用
         float(bcfg.stop_trail_pct),
         bcfg.stop_ratchet_flat(),
+        float(_CAL.bars_per_year),       # Sharpe 年化 = sqrt(bars_per_year);crypto 105120
     )
     out = {
         'total_return':  float(res['total_return']),
